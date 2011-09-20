@@ -93,6 +93,7 @@ from functools import partial
 from tornado.ioloop import IOLoop
 
 class CallbackDispatcher(object):
+    __slots__ = ('g', 'io_loop', 'call_count')
     def __init__(self, generator):
         self.io_loop = IOLoop.instance()
         self.g = generator
@@ -118,10 +119,11 @@ class CallbackDispatcher(object):
         single = not hasattr(callers, '__iter__')
         if single:
             callers = [callers]
-        self.call_count = len(list(callers))
+        self.call_count = len(callers)
         results = [None] * self.call_count
         if self.call_count == 0:
-            self._queue_send_result(results, single)
+            self._send_result(results, single)
+#            self._queue_send_result(results, single)
         else:
             for count, caller in enumerate(callers):
                 caller(callback=partial(self.callback, results, count, single))
@@ -131,7 +133,8 @@ class CallbackDispatcher(object):
         results[index] = arg
         if self.call_count > 0:
             return
-        self._queue_send_result(results, single)
+        self._send_result(results, single)
+#        self._queue_send_result(results, single)
 
 def process(func):
     def wrapper(*args, **kwargs):

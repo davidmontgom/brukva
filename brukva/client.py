@@ -6,6 +6,8 @@ import logging
 from collections import Iterable, defaultdict
 import weakref
 import traceback
+import time
+import redis
 
 from tornado.ioloop import IOLoop
 from tornado.iostream import IOStream
@@ -13,6 +15,7 @@ from adisp import async, process
 
 from datetime import datetime
 from brukva.exceptions import RequestError, ConnectionError, ResponseError, InvalidResponse
+from brukva.stream import BrukvaStream
 
 log = logging.getLogger('brukva.client')
 
@@ -83,12 +86,12 @@ def execution_context(callbacks, error_wrapper=None):
     return ExecutionContext(callbacks, error_wrapper)
 
 class Message(object):
-    ''' Wrapper Message object.
+    """ Wrapper Message object.
         kind = command
        channel = channel from which the message was received
         pattern = subscription pattern
         body = message body
-    '''
+    """
     def __init__(self, *args):
         if len(args) == 3:
             (self.kind, self.channel, self.body) = args
@@ -143,6 +146,7 @@ class Connection(object):
         self._stream = None
         self._io_loop = io_loop
         self.try_left = 2
+        self._consume_buffer = None
 
         self.in_progress = False
         self.read_queue = []
@@ -153,7 +157,7 @@ class Connection(object):
             sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
             sock.settimeout(self.timeout)
             sock.connect((self.host, self.port))
-            self._stream = IOStream(sock, io_loop=self._io_loop)
+            self._stream = BrukvaStream(sock, io_loop=self._io_loop)
             self.connected()
         except socket.error, e:
             raise ConnectionError(str(e))
@@ -189,7 +193,15 @@ class Connection(object):
             if not self._stream:
                 self.disconnect()
                 raise ConnectionError('Tried to read from non-existent connection')
-            self._stream.read_bytes(length, callback)
+            
+            if self._consume_buffer:
+#                logging.debug("Consume buffer %r" % self._consume_buffer)
+                callback(self._consume_buffer[:length])
+                self._consume_buffer = self._consume_buffer[length:]
+#                logging.debug("Consume buffer %r" % self._consume_buffer)
+            else:
+                self._stream.read_bytes(length, callback)
+                
         except IOError:
             self.on_disconnect()
 
@@ -198,21 +210,47 @@ class Connection(object):
             if not self._stream:
                 self.disconnect()
                 raise ConnectionError('Tried to read from non-existent connection')
-            self._stream.read_until('\r\n', callback)
+#            logging.debug("Reading line")
+
+            if self._consume_buffer:
+#                logging.debug("Consume buffer %r" % self._consume_buffer)
+                data = self._consume_buffer.split('\r\n',1)
+                assert len(data) != 1, 'Wrong buffer (no line delimeter) %r' % data
+                self._consume_buffer = data[1]
+#                logging.debug("Consume buffer %r" % self._consume_buffer)
+                callback('\r\n'.join([data[0], '']))
+            else:
+                self._stream.read_until('\r\n', callback)
         except IOError:
             self.on_disconnect()
 
+    def readlines(self, num, callback):
+        try:
+            if not self._stream:
+                self.disconnect()
+                raise ConnectionError('Tried to read from non-existent connection')
+#            logging.debug("Reading %s lines" % num)
+            self._stream.read_until_times('\r\n', num, callback)
+        except IOError:
+            self.on_disconnect()
+            
     def try_to_perform_read(self):
+        # have callbacks in queue and process no started
         if not self.in_progress and self.read_queue:
+#            logging.debug("Try to perform read, adding callback to ioloop")
             self.in_progress = True
+            # execute oldest callback on next ioloop iteration, with result = None
             self._io_loop.add_callback(partial(self.read_queue.pop(0), None) )
+#        logging.debug("Try to perform read, fail!")
 
     @async
-    def queue_wait(self, callback):
+    def queue_wait(self, callback=None):
+#        logging.debug("Queue wait")
         self.read_queue.append(callback)
         self.try_to_perform_read()
 
     def read_done(self):
+#        logging.debug("Read done function")
         self.in_progress = False
         self.try_to_perform_read()
 
@@ -301,14 +339,29 @@ class _AsyncWrapper(object):
             self.memoized[item] = async(getattr(self.obj, item), cbname='callbacks')
         return self.memoized[item]
 
+class SyncWrapper(object):
+    def __init__(self, host, port, db=9):
+        self.r = redis.Redis(host, port, db=db)
+
+    def __getattr__(self, item, **kwargs):
+        return partial(self.async, item)
+
+    def async(self, method, item, *args, **kwargs):
+        m = getattr(self.r, method)
+        res = m(item, *args)
+        return lambda callback: callback(res)
 
 class Client(object):
     def __init__(self, host='localhost', port=6379, password=None,
-            selected_db=None, io_loop=None):
+            selected_db=None, io_loop=None, yield_mode=False):
+        self.yield_mode = yield_mode
+        self.memoized = {}
         self._io_loop = io_loop or IOLoop.instance()
         self.connection = Connection(host, port,
             self.on_connect, self.on_disconnect, io_loop=self._io_loop)
+
         self.async = _AsyncWrapper(weakref.proxy(self))
+
         self.queue = []
         self.current_cmd_line = None
         self.subscribed = False
@@ -346,6 +399,21 @@ class Client(object):
 
         self._waiting_callbacks = defaultdict(list)
         self._pipeline = None
+
+    def __getattribute__(self, name):
+        """
+        Allow to remove AsyncWrapper from chain of calls
+        """
+        attr = super(Client, self).__getattribute__(name)
+        if super(Client, self).__getattribute__('yield_mode'):
+            func_name = getattr(attr, 'func_name', None)
+            if func_name:
+                if 'callbacks' in attr.func_code.co_varnames:
+                    memoized = super(Client, self).__getattribute__('memoized')
+                    if name not in memoized:
+                        memoized[name] = async(attr, cbname='callbacks')
+                    return memoized[name]
+        return attr
 
     def __repr__(self):
         return 'Brukva client (host=%s, port=%s)' % (self.connection.host, self.connection.port)
@@ -439,6 +507,7 @@ class Client(object):
 
             yield self.connection.queue_wait()
             data = yield async(self.connection.readline)()
+#            logging.debug("execute_command data = %r" % data)
             if not data:
                 result = None
                 self.connection.read_done()
@@ -447,21 +516,23 @@ class Client(object):
                 response = yield self.process_data(data, cmd_line)
                 result = self.format_reply(cmd_line, response)
 
+#                logging.debug("READ DONE")
                 self.connection.read_done()
             ctx.ret_call(result)
 
     @async
     @process
-    def process_data(self, data, cmd_line, callback):
+    def process_data(self, original_data, cmd_line, callback):
+#        logging.debug("Processing data %r" % original_data)
         with execution_context(callback) as ctx:
-            data = data[:-2] # strip \r\n
+            data = original_data[:-2] # strip \r\n
 
             if data == '$-1':
                 response =  None
             elif data == '*0' or data == '*-1':
                 response = []
             else:
-                if len(data) == 0:
+                if not len(data):
                     raise IOError('Disconnected')
                 head, tail = data[0], data[1:]
 
@@ -488,6 +559,7 @@ class Client(object):
             tokens = []
             while len(tokens) < length:
                 data = yield async(self.connection.readline)()
+#                logging.debug("Consume multibulk: %s" % data)
                 if not data:
                     raise ResponseError(
                         'Not enough data in response to %s, accumulated tokens: %s'%
@@ -495,14 +567,39 @@ class Client(object):
                     )
                 token = yield self.process_data(data, cmd_line) #FIXME error
                 tokens.append( token )
-
             ctx.ret_call(tokens)
 
     @async
     @process
+    def _consume_multibulk(self, length, cmd_line, callback):
+        with execution_context(callback) as ctx:
+            tokens = []
+            data = yield async(self.connection.readlines)(length*2)
+#            logging.debug("Consume multibulk: %r" % data)
+            if not data:
+                raise ResponseError(
+                    'Not enough data in response to %s, accumulated tokens: %s'%
+                    (cmd_line, tokens), cmd_line
+                )
+            self.set_consume_buffer(data)
+            while len(tokens) < length:
+                data = yield async(self.connection.readline)()
+                if not data:
+                    raise ResponseError(
+                        'Not enough data in response to %s, accumulated tokens: %s'%
+                        (cmd_line, tokens), cmd_line
+                    )
+                token = yield self.process_data(data, cmd_line) #FIXME error
+                tokens.append( token )
+        ctx.ret_call(tokens)
+
+    @async
+    @process
     def consume_bulk(self, length, callback):
+#        logging.debug("Consume bulk length %s" % length)
         with execution_context(callback) as ctx:
             data = yield async(self.connection.read)(length)
+#            logging.debug("Consume bulk: %r" % data)
             if isinstance(data, Exception):
                 raise data
             if not data:
@@ -841,6 +938,9 @@ class Client(object):
     def hset(self, key, field, value, callbacks=None):
         self.execute_command('HSET', callbacks, key, field, value)
 
+    def hsetnx(self, key, field, value, callbacks=None):
+        self.execute_command('HSETNX', callbacks, key, field, value)
+
     def hget(self, key, field, callbacks=None):
         self.execute_command('HGET', callbacks, key, field)
 
@@ -951,6 +1051,10 @@ class Client(object):
 
     def unwatch(self, callbacks=None):
         self.execute_command('UNWATCH', callbacks)
+
+    def set_consume_buffer(self, data):
+        self.connection._consume_buffer = data
+
 
 class Pipeline(Client):
     def __init__(self, transactional, *args, **kwargs):

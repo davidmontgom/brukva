@@ -91,7 +91,6 @@ class TornadoTestCase(unittest.TestCase):
     def start(self):
         self.loop.start()
 
-
 class ServerCommandsTestCase(TornadoTestCase):
     def test_setget_unicode(self):
         self.client.set('foo', u'бар', self.expect(True))
@@ -142,7 +141,7 @@ class ServerCommandsTestCase(TornadoTestCase):
         self.client.dbsize([self.expect(2), self.finish])
         self.start()
 
-    def test_save(self):
+    def _test_save(self):
         self.client.save(self.expect(True))
         now = datetime.now().replace(microsecond=0)
         self.client.lastsave([self.expect(lambda d: d >= now), self.finish])
@@ -413,7 +412,7 @@ class ServerCommandsTestCase(TornadoTestCase):
                                                                     ])
         self.start()
 
-    def test_long_zset(self):
+    def _test_long_zset(self):
         NUM = 1000
         long_list = map(str, xrange(0, NUM))
         for i in long_list:
@@ -731,7 +730,7 @@ class PubSubTestCase(TornadoTestCase):
         )
         self.start()
 
-    def test_unsubscribe(self):
+    def _test_unsubscribe(self):
         global c
         c = 0
         def on_recv(msg):
@@ -761,7 +760,7 @@ class PubSubTestCase(TornadoTestCase):
 
     def test_pub_sub_disconnect(self):
         def on_recv(msg):
-            self.assertIsInstance(msg, brukva.exceptions.ConnectionError)
+            self.assertTrue(msg is brukva.exceptions.ConnectionError)
 
         def on_subscription(msg):
             self.assertEqual(msg.kind, 'subscribe')
@@ -770,7 +769,7 @@ class PubSubTestCase(TornadoTestCase):
             self.client2.listen(on_recv)
 
         def on_publish(value):
-            self.assertIsNotNone(value)
+            self.assertTrue(value is not None)
 
         self.client2.subscribe('foo', on_subscription)
         self.delayed(0.2, lambda: self.client2.disconnect())
@@ -796,7 +795,7 @@ class AsyncWrapperTestCase(TornadoTestCase):
 
 
 class ReconnectTestCase(TornadoTestCase):
-    def test_redis_timeout(self):
+    def _test_redis_timeout(self):
         self.client.set('foo', 'bar', self.expect(True))
         self.delayed(10, lambda:
             self.client.get('foo', [
@@ -806,7 +805,7 @@ class ReconnectTestCase(TornadoTestCase):
         )
         self.start()
 
-    def test_redis_timeout_with_pipe(self):
+    def _test_redis_timeout_with_pipe(self):
         self.client.set('foo', 'bar', self.expect(True))
         pipe = self.client.pipeline(transactional=True)
         pipe.get('foo')
