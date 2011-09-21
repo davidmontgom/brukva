@@ -285,9 +285,6 @@ def reply_float(r, *args, **kwargs):
 def reply_datetime(r, *args, **kwargs):
     return datetime.fromtimestamp(int(r))
 
-def reply_pubsub_message(r, *args, **kwargs):
-    return Message(*r)
-
 def reply_zset(r, *args, **kwargs):
     if (not r ) or (not 'WITHSCORES' in args):
         return r
@@ -319,15 +316,6 @@ def reply_info(response):
 
 def reply_ttl(r, *args, **kwargs):
     return r != -1 and r or None
-
-
-PUB_SUB_COMMANDS = set([
-    'SUBSCRIBE',
-    'PSUBSCRIBE',
-    'UNSUBSCRIBE',
-    'PUNSUBSCRIBE',
-    'LISTEN',
-])
 
 class _AsyncWrapper(object):
     def __init__(self, obj):
@@ -364,7 +352,6 @@ class Client(object):
 
         self.queue = []
         self.current_cmd_line = None
-        self.subscribed = False
         self.password = password
         self.selected_db = selected_db
         self.REPLY_MAP = dict_merge(
@@ -380,9 +367,6 @@ class Client(object):
                                     reply_dict_from_pairs),
                 string_keys_to_dict('HGET',
                                     reply_str),
-                string_keys_to_dict('SUBSCRIBE UNSUBSCRIBE LISTEN '
-                                    'PSUBSCRIBE UNSUBSCRIBE',
-                                    reply_pubsub_message),
                 string_keys_to_dict('ZRANK ZREVRANK',
                                     reply_int),
                 string_keys_to_dict('ZSCORE ZINCRBY ZCOUNT ZCARD',
@@ -443,8 +427,6 @@ class Client(object):
             self.select(self.selected_db)
 
     def on_disconnect(self):
-        if self.subscribed:
-            self.subscribed = False
         raise ConnectionError("Socket closed on remote end")
     ####
 
@@ -491,19 +473,11 @@ class Client(object):
             elif not hasattr(callbacks, '__iter__'):
                 callbacks = [callbacks]
 
-            if self.subscribed and cmd not in PUB_SUB_COMMANDS:
-                ctx.ret_call(RequestError('Calling not pub/sub command during subscribed state', cmd_line))
-                return
-
             try:
                 self.connection.write(self.format(cmd, *args, **kwargs))
             except Exception, e:
                 self.connection.disconnect()
                 raise e
-
-            if self.subscribed and cmd in ('SUBSCRIBE', 'UNSUBSCRIBE'):
-                self._waiting_callbacks[cmd].append(callbacks)
-                return
 
             yield self.connection.queue_wait()
             data = yield async(self.connection.readline)()
@@ -965,86 +939,6 @@ class Client(object):
     def hvals(self, key, callbacks=None):
         self.execute_command('HVALS', callbacks, key)
 
-    ### PUBSUB
-    def subscribe(self, channels, callbacks=None):
-        self._subscribe('SUBSCRIBE', channels, callbacks)
-
-    def psubscribe(self, channels, callbacks=None):
-        self._subscribe('PSUBSCRIBE', channels, callbacks)
-
-    def _subscribe(self, cmd, channels, callbacks=None):
-        callbacks = callbacks or []
-        if not isinstance(callbacks, Iterable):
-            callbacks = [callbacks]
-        if isinstance(channels, basestring):
-            channels = [channels]
-        if not self.subscribed:
-            callbacks = list(callbacks) + [self.on_subscribed]
-        self.execute_command(cmd, callbacks, *channels)
-
-    def on_subscribed(self, result):
-        self.subscribed = True
-
-    def unsubscribe(self, channels, callbacks=None):
-        self._unsubscribe('UNSUBSCRIBE', channels, callbacks)
-
-    def punsubscribe(self, channels, callbacks=None):
-        self._unsubscribe('UNSUBSCRIBE', channels, callbacks)
-
-    def _unsubscribe(self, cmd, channels, callbacks=None):
-        callbacks = callbacks or []
-        if not isinstance(callbacks, Iterable):
-            callbacks = [callbacks]
-        if isinstance(channels, basestring):
-            channels = [channels]
-        callbacks = list(callbacks)
-        self.execute_command(cmd, callbacks, *channels)
-
-    def on_unsubscribed(self, *args, **kwargs):
-        self.subscribed = False
-
-    def publish(self, channel, message, callbacks=None):
-        self.execute_command('PUBLISH', callbacks, channel, message)
-
-    @process
-    def listen(self, callbacks=None):
-        # 'LISTEN' is just for receiving information, it is not actually sent anywhere
-        def error_wrapper(e):
-            if isinstance(e, GeneratorExit):
-                return ConnectionError('Connection lost')
-            else:
-                return e
-
-        with execution_context(callbacks, error_wrapper) as ctx:
-            callbacks = callbacks or []
-            if not hasattr(callbacks, '__iter__'):
-                callbacks = [callbacks]
-            yield self.connection.queue_wait()
-
-            cmd_listen = CmdLine('LISTEN')
-            while self.subscribed:
-                data = yield async(self.connection.readline)()
-                if isinstance(data, Exception):
-                    raise data
-
-                response = yield self.process_data(data, cmd_listen)
-                if isinstance(response, Exception):
-                    raise response
-
-                result = self.format_reply(cmd_listen, response)
-
-                if result.kind not in ('message', 'pmessage'):
-                    waiting_stack = self._waiting_callbacks[result.kind.upper()]
-                    if len(waiting_stack) > 0:
-                        ctx.safe_call(waiting_stack.pop(0), result)
-
-                    if result.kind == 'unsubscribe' and result.body == 0:
-                        self.on_unsubscribed()
-                        self.connection.read_done()
-                        break
-                else:
-                    ctx.ret_call(result)
-
     ### CAS
     def watch(self, key, callbacks=None):
         self.execute_command('WATCH', callbacks, key)
@@ -1065,9 +959,6 @@ class Pipeline(Client):
     def execute_command(self, cmd, callbacks, *args, **kwargs):
         if cmd in ('AUTH', 'SELECT'):
             super(Pipeline, self).execute_command(cmd, callbacks, *args, **kwargs)
-        elif cmd in PUB_SUB_COMMANDS:
-            raise RequestError(
-                'Client is not supposed to issue command %s in pipeline' % cmd)
         self.command_stack.append(CmdLine(cmd, *args, **kwargs))
 
     def discard(self): # actually do nothing with redis-server, just flush command_stack
