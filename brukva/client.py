@@ -6,15 +6,12 @@ import logging
 from collections import Iterable, defaultdict
 import weakref
 import traceback
-import time
-import redis
 
 from tornado.ioloop import IOLoop
-from tornado.iostream import IOStream
 from adisp import async, process
 
 from datetime import datetime
-from brukva.exceptions import RequestError, ConnectionError, ResponseError, InvalidResponse
+from brukva.exceptions import  ConnectionError, ResponseError
 from brukva.stream import BrukvaStream
 
 log = logging.getLogger('brukva.client')
@@ -84,22 +81,6 @@ def execution_context(callbacks, error_wrapper=None):
     @rtype: context
     """
     return ExecutionContext(callbacks, error_wrapper)
-
-class Message(object):
-    """ Wrapper Message object.
-        kind = command
-       channel = channel from which the message was received
-        pattern = subscription pattern
-        body = message body
-    """
-    def __init__(self, *args):
-        if len(args) == 3:
-            (self.kind, self.channel, self.body) = args
-            self.pattern = self.channel
-        elif len(args) == 4:
-            (self.kind, self.channel, self.pattern, self.body) = args
-        else:
-            raise ValueError('Invalid number of arguments')
 
 class CmdLine(object):
     def __init__(self, cmd, *args, **kwargs):
@@ -324,20 +305,11 @@ class _AsyncWrapper(object):
 
     def __getattr__(self, item):
         if item not in self.memoized:
-            self.memoized[item] = async(getattr(self.obj, item), cbname='callbacks')
+            if getattr(self.obj, 'yield_mode'):
+                self.memoized[item] = getattr(self.obj, item)
+            else:
+                self.memoized[item] = async(getattr(self.obj, item), cbname='callbacks')
         return self.memoized[item]
-
-class SyncWrapper(object):
-    def __init__(self, host, port, db=9):
-        self.r = redis.Redis(host, port, db=db)
-
-    def __getattr__(self, item, **kwargs):
-        return partial(self.async, item)
-
-    def async(self, method, item, *args, **kwargs):
-        m = getattr(self.r, method)
-        res = m(item, *args)
-        return lambda callback: callback(res)
 
 class Client(object):
     def __init__(self, host='localhost', port=6379, password=None,
@@ -497,7 +469,7 @@ class Client(object):
     @async
     @process
     def process_data(self, original_data, cmd_line, callback):
-#        logging.debug("Processing data %r" % original_data)
+        logging.debug("Processing data %r" % original_data)
         with execution_context(callback) as ctx:
             data = original_data[:-2] # strip \r\n
 
