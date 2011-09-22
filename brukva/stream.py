@@ -23,7 +23,6 @@ class BrukvaStream(IOStream):
             chunks = self._read_buffer[0].split(self._read_delimiter, self._read_delimiter_times)[:-1]
 #            logging.debug("READ BUFFER % s" % self._read_buffer)
 #            logging.debug("Chunks: %s " % chunks)
-
             if chunks:
                 chunks_str = '\r\n'.join(chunks)
                 callback = self._read_callback

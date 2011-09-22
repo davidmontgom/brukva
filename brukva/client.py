@@ -11,7 +11,7 @@ from tornado.ioloop import IOLoop
 from adisp import async, process
 
 from datetime import datetime
-from brukva.exceptions import  ConnectionError, ResponseError
+from brukva.exceptions import  ConnectionError, ResponseError, RedisError
 from brukva.stream import BrukvaStream
 
 log = logging.getLogger('brukva.client')
@@ -43,7 +43,7 @@ class ExecutionContext(object):
             value = value or Exception(
                 'Strange exception with None value type: %s; tb: %s' %
                 (type_, '\n'.join(traceback.format_tb(tb))
-            ))
+                    ))
 
         if self.is_active:
             log.error(value, exc_info=(type_, value, tb))
@@ -82,6 +82,7 @@ def execution_context(callbacks, error_wrapper=None):
     """
     return ExecutionContext(callbacks, error_wrapper)
 
+
 class CmdLine(object):
     def __init__(self, cmd, *args, **kwargs):
         self.cmd = cmd
@@ -89,23 +90,27 @@ class CmdLine(object):
         self.kwargs = kwargs
 
     def __repr__(self):
-        return self.cmd + '(' + str(self.args)  + ',' + str(self.kwargs) + ')'
+        return self.cmd + '(' + str(self.args) + ',' + str(self.kwargs) + ')'
+
 
 def string_keys_to_dict(key_string, callback):
     return dict([(key, callback) for key in key_string.split()])
+
 
 def dict_merge(*dicts):
     merged = {}
     [merged.update(d) for d in dicts]
     return merged
 
+
 def encode(value):
     if isinstance(value, str):
         return value
     elif isinstance(value, unicode):
         return value.encode('utf-8')
-    # pray and hope
+        # pray and hope
     return str(value)
+
 
 def format(*tokens):
     cmds = []
@@ -114,8 +119,10 @@ def format(*tokens):
         cmds.append('$%s\r\n%s\r\n' % (len(e_t), e_t))
     return '*%s\r\n%s' % (len(tokens), ''.join(cmds))
 
+
 def format_pipeline_request(command_stack):
     return ''.join(format(c.cmd, *c.args, **c.kwargs) for c in command_stack)
+
 
 class Connection(object):
     def __init__(self, host, port, on_connect, on_disconnect, timeout=None, io_loop=None):
@@ -174,15 +181,15 @@ class Connection(object):
             if not self._stream:
                 self.disconnect()
                 raise ConnectionError('Tried to read from non-existent connection')
-            
+
             if self._consume_buffer:
-#                logging.debug("Consume buffer %r" % self._consume_buffer)
+            #                logging.debug("Consume buffer %r" % self._consume_buffer)
                 callback(self._consume_buffer[:length])
                 self._consume_buffer = self._consume_buffer[length:]
-#                logging.debug("Consume buffer %r" % self._consume_buffer)
+            #                logging.debug("Consume buffer %r" % self._consume_buffer)
             else:
                 self._stream.read_bytes(length, callback)
-                
+
         except IOError:
             self.on_disconnect()
 
@@ -191,14 +198,14 @@ class Connection(object):
             if not self._stream:
                 self.disconnect()
                 raise ConnectionError('Tried to read from non-existent connection')
-#            logging.debug("Reading line")
+            #            logging.debug("Reading line")
 
             if self._consume_buffer:
-#                logging.debug("Consume buffer %r" % self._consume_buffer)
-                data = self._consume_buffer.split('\r\n',1)
+            #                logging.debug("Consume buffer %r" % self._consume_buffer)
+                data = self._consume_buffer.split('\r\n', 1)
                 assert len(data) != 1, 'Wrong buffer (no line delimeter) %r' % data
                 self._consume_buffer = data[1]
-#                logging.debug("Consume buffer %r" % self._consume_buffer)
+                #                logging.debug("Consume buffer %r" % self._consume_buffer)
                 callback('\r\n'.join([data[0], '']))
             else:
                 self._stream.read_until('\r\n', callback)
@@ -210,28 +217,28 @@ class Connection(object):
             if not self._stream:
                 self.disconnect()
                 raise ConnectionError('Tried to read from non-existent connection')
-#            logging.debug("Reading %s lines" % num)
+            #            logging.debug("Reading %s lines" % num)
             self._stream.read_until_times('\r\n', num, callback)
         except IOError:
             self.on_disconnect()
-            
+
     def try_to_perform_read(self):
         # have callbacks in queue and process no started
         if not self.in_progress and self.read_queue:
-#            logging.debug("Try to perform read, adding callback to ioloop")
+        #            logging.debug("Try to perform read, adding callback to ioloop")
             self.in_progress = True
             # execute oldest callback on next ioloop iteration, with result = None
-            self._io_loop.add_callback(partial(self.read_queue.pop(0), None) )
-#        logging.debug("Try to perform read, fail!")
+            self._io_loop.add_callback(partial(self.read_queue.pop(0), None))
+        #        logging.debug("Try to perform read, fail!")
 
     @async
     def queue_wait(self, callback=None):
-#        logging.debug("Queue wait")
+    #        logging.debug("Queue wait")
         self.read_queue.append(callback)
         self.try_to_perform_read()
 
     def read_done(self):
-#        logging.debug("Read done function")
+    #        logging.debug("Read done function")
         self.in_progress = False
         self.try_to_perform_read()
 
@@ -240,42 +247,55 @@ class Connection(object):
             return True
         return False
 
+
 def reply_to_bool(r, *args, **kwargs):
     return bool(r)
+
 
 def make_reply_assert_msg(msg):
     def reply_assert_msg(r, *args, **kwargs):
         return r == msg
+
     return reply_assert_msg
+
 
 def reply_set(r, *args, **kwargs):
     return set(r)
 
+
 def reply_dict_from_pairs(r, *args, **kwargs):
     return dict(izip(r[::2], r[1::2]))
+
 
 def reply_str(r, *args, **kwargs):
     return r or ''
 
+
 def reply_int(r, *args, **kwargs):
     return int(r) if r is not None else None
+
 
 def reply_float(r, *args, **kwargs):
     return float(r) if r is not None else None
 
+
 def reply_datetime(r, *args, **kwargs):
     return datetime.fromtimestamp(int(r))
+
 
 def reply_zset(r, *args, **kwargs):
     if (not r ) or (not 'WITHSCORES' in args):
         return r
     return zip(r[::2], map(float, r[1::2]))
 
+
 def reply_hmget(r, key, *fields, **kwargs):
     return dict(zip(fields, r))
 
+
 def reply_info(response):
     info = {}
+
     def get_value(value):
         if ',' not in value:
             return value
@@ -287,6 +307,7 @@ def reply_info(response):
             except ValueError:
                 sub_dict[k] = v
         return sub_dict
+
     for line in response.splitlines():
         key, value = line.split(':')
         try:
@@ -295,8 +316,10 @@ def reply_info(response):
             info[key] = get_value(value)
     return info
 
+
 def reply_ttl(r, *args, **kwargs):
     return r != -1 and r or None
+
 
 class _AsyncWrapper(object):
     def __init__(self, obj):
@@ -311,14 +334,15 @@ class _AsyncWrapper(object):
                 self.memoized[item] = async(getattr(self.obj, item), cbname='callbacks')
         return self.memoized[item]
 
+
 class Client(object):
     def __init__(self, host='localhost', port=6379, password=None,
-            selected_db=None, io_loop=None, yield_mode=False):
+                 selected_db=None, io_loop=None, yield_mode=False):
         self.yield_mode = yield_mode
         self.memoized = {}
         self._io_loop = io_loop or IOLoop.instance()
         self.connection = Connection(host, port,
-            self.on_connect, self.on_disconnect, io_loop=self._io_loop)
+                                     self.on_connect, self.on_disconnect, io_loop=self._io_loop)
 
         self.async = _AsyncWrapper(weakref.proxy(self))
 
@@ -327,28 +351,29 @@ class Client(object):
         self.password = password
         self.selected_db = selected_db
         self.REPLY_MAP = dict_merge(
-                string_keys_to_dict('AUTH BGREWRITEAOF BGSAVE DEL EXISTS EXPIRE HDEL HEXISTS '
-                                    'HMSET MOVE MSET MSETNX SAVE SETNX',
-                                    reply_to_bool),
-                string_keys_to_dict('FLUSHALL FLUSHDB SELECT SET SETEX SHUTDOWN '
-                                    'RENAME RENAMENX WATCH UNWATCH',
-                                    make_reply_assert_msg('OK')),
-                string_keys_to_dict('SMEMBERS SINTER SUNION SDIFF',
-                                    reply_set),
-                string_keys_to_dict('HGETALL BRPOP BLPOP',
-                                    reply_dict_from_pairs),
-                string_keys_to_dict('HGET',
-                                    reply_str),
-                string_keys_to_dict('ZRANK ZREVRANK',
-                                    reply_int),
-                string_keys_to_dict('ZSCORE ZINCRBY ZCOUNT ZCARD',
-                                    reply_int),
-                string_keys_to_dict('ZRANGE ZRANGEBYSCORE ZREVRANGE',
-                                    reply_zset),
+            string_keys_to_dict('AUTH BGREWRITEAOF BGSAVE DEL EXISTS EXPIRE HDEL HEXISTS '
+                                'HMSET MOVE MSET MSETNX SAVE SETNX',
+                                reply_to_bool),
+            string_keys_to_dict('FLUSHALL FLUSHDB SELECT SET SETEX SHUTDOWN '
+                                'RENAME RENAMENX WATCH UNWATCH',
+                                make_reply_assert_msg('OK')),
+            string_keys_to_dict('SMEMBERS SINTER SUNION SDIFF',
+                                reply_set),
+            string_keys_to_dict('HGETALL BRPOP BLPOP',
+                                reply_dict_from_pairs),
+            string_keys_to_dict('HGET',
+                                reply_str),
+            string_keys_to_dict('ZRANK ZREVRANK',
+                                reply_int),
+            string_keys_to_dict('ZSCORE ZINCRBY ZCOUNT ZCARD',
+                                reply_int),
+            string_keys_to_dict('ZRANGE ZRANGEBYSCORE ZREVRANGE',
+                                reply_zset),
+            string_keys_to_dict('LLEN', reply_int),
                 {'HMGET': reply_hmget},
                 {'PING': make_reply_assert_msg('PONG')},
-                {'LASTSAVE': reply_datetime },
-                {'TTL': reply_ttl } ,
+                {'LASTSAVE': reply_datetime},
+                {'TTL': reply_ttl},
                 {'INFO': reply_info},
                 {'MULTI_PART': make_reply_assert_msg('QUEUED')},
             )
@@ -378,7 +403,7 @@ class Client(object):
         if not self._pipeline:
             self._pipeline = Pipeline(
                 selected_db=self.selected_db,
-                io_loop = self._io_loop,
+                io_loop=self._io_loop,
                 transactional=transactional
             )
             self._pipeline.connection = self.connection
@@ -400,6 +425,7 @@ class Client(object):
 
     def on_disconnect(self):
         raise ConnectionError("Socket closed on remote end")
+
     ####
 
     #### formatting
@@ -408,7 +434,7 @@ class Client(object):
             return value
         elif isinstance(value, unicode):
             return value.encode('utf-8')
-        # pray and hope
+            # pray and hope
         return str(value)
 
     def format(self, *tokens):
@@ -422,13 +448,14 @@ class Client(object):
         if cmd_line.cmd not in self.REPLY_MAP:
             return data
         try:
-            res =  self.REPLY_MAP[cmd_line.cmd](data, *cmd_line.args, **cmd_line.kwargs)
+            res = self.REPLY_MAP[cmd_line.cmd](data, *cmd_line.args, **cmd_line.kwargs)
         except Exception, e:
             raise ResponseError(
                 'failed to format reply to %s, raw data: %s; err message: %s' %
                 (cmd_line, data, e), cmd_line
             )
         return res
+
     ####
 
     #### new AsIO
@@ -453,28 +480,31 @@ class Client(object):
 
             yield self.connection.queue_wait()
             data = yield async(self.connection.readline)()
-#            logging.debug("execute_command data = %r" % data)
+            #            logging.debug("execute_command data = %r" % data)
             if not data:
                 result = None
                 self.connection.read_done()
                 raise Exception('TODO: [no data from connection->readline')
             else:
-                response = yield self.process_data(data, cmd_line)
-                result = self.format_reply(cmd_line, response)
-
-#                logging.debug("READ DONE")
+                try:
+                    response = yield self.process_data(data, cmd_line)
+                    result = self.format_reply(cmd_line, response)
+                    print cmd_line, data, response
+                except RedisError as e:
+                    result = e
+                #                logging.debug("READ DONE")
                 self.connection.read_done()
             ctx.ret_call(result)
 
     @async
     @process
-    def process_data(self, original_data, cmd_line, callback):
+    def process_data(self, original_data, cmd_line, callback=None):
         logging.debug("Processing data %r" % original_data)
         with execution_context(callback) as ctx:
             data = original_data[:-2] # strip \r\n
 
             if data == '$-1':
-                response =  None
+                response = None
             elif data == '*0' or data == '*-1':
                 response = []
             else:
@@ -485,7 +515,7 @@ class Client(object):
                 if head == '*':
                     response = yield self.consume_multibulk(int(tail), cmd_line)
                 elif head == '$':
-                    response = yield self.consume_bulk(int(tail)+2)
+                    response = yield self.consume_bulk(int(tail) + 2)
                 elif head == '+':
                     response = tail
                 elif head == ':':
@@ -505,14 +535,14 @@ class Client(object):
             tokens = []
             while len(tokens) < length:
                 data = yield async(self.connection.readline)()
-#                logging.debug("Consume multibulk: %s" % data)
+                #                logging.debug("Consume multibulk: %s" % data)
                 if not data:
                     raise ResponseError(
-                        'Not enough data in response to %s, accumulated tokens: %s'%
+                        'Not enough data in response to %s, accumulated tokens: %s' %
                         (cmd_line, tokens), cmd_line
                     )
                 token = yield self.process_data(data, cmd_line) #FIXME error
-                tokens.append( token )
+                tokens.append(token)
             ctx.ret_call(tokens)
 
     @async
@@ -520,11 +550,11 @@ class Client(object):
     def _consume_multibulk(self, length, cmd_line, callback):
         with execution_context(callback) as ctx:
             tokens = []
-            data = yield async(self.connection.readlines)(length*2)
-#            logging.debug("Consume multibulk: %r" % data)
+            data = yield async(self.connection.readlines)(length * 2)
+            #            logging.debug("Consume multibulk: %r" % data)
             if not data:
                 raise ResponseError(
-                    'Not enough data in response to %s, accumulated tokens: %s'%
+                    'Not enough data in response to %s, accumulated tokens: %s' %
                     (cmd_line, tokens), cmd_line
                 )
             self.set_consume_buffer(data)
@@ -532,20 +562,20 @@ class Client(object):
                 data = yield async(self.connection.readline)()
                 if not data:
                     raise ResponseError(
-                        'Not enough data in response to %s, accumulated tokens: %s'%
+                        'Not enough data in response to %s, accumulated tokens: %s' %
                         (cmd_line, tokens), cmd_line
                     )
                 token = yield self.process_data(data, cmd_line) #FIXME error
-                tokens.append( token )
+                tokens.append(token)
         ctx.ret_call(tokens)
 
     @async
     @process
     def consume_bulk(self, length, callback):
-#        logging.debug("Consume bulk length %s" % length)
+    #        logging.debug("Consume bulk length %s" % length)
         with execution_context(callback) as ctx:
             data = yield async(self.connection.read)(length)
-#            logging.debug("Consume bulk: %r" % data)
+            #            logging.debug("Consume bulk: %r" % data)
             if isinstance(data, Exception):
                 raise data
             if not data:
@@ -553,7 +583,7 @@ class Client(object):
             else:
                 data = data[:-2]
             ctx.ret_call(data)
-        ####
+            ####
 
     ### MAINTENANCE
     def bgrewriteaof(self, callbacks=None):
@@ -638,12 +668,12 @@ class Client(object):
 
     def mset(self, mapping, callbacks=None):
         items = []
-        [ items.extend(pair) for pair in mapping.iteritems() ]
+        [items.extend(pair) for pair in mapping.iteritems()]
         self.execute_command('MSET', callbacks, *items)
 
     def msetnx(self, mapping, callbacks=None):
         items = []
-        [ items.extend(pair) for pair in mapping.iteritems() ]
+        [items.extend(pair) for pair in mapping.iteritems()]
         self.execute_command('MSETNX', callbacks, *items)
 
     def get(self, key, callbacks=None):
@@ -878,7 +908,7 @@ class Client(object):
 
     def hmset(self, key, mapping, callbacks=None):
         items = []
-        [ items.extend(pair) for pair in mapping.iteritems() ]
+        [items.extend(pair) for pair in mapping.iteritems()]
         self.execute_command('HMSET', callbacks, key, *items)
 
     def hset(self, key, field, value, callbacks=None):
@@ -950,7 +980,7 @@ class Pipeline(Client):
             if self.transactional:
                 command_stack = [CmdLine('MULTI')] + command_stack + [CmdLine('EXEC')]
 
-            request =  format_pipeline_request(command_stack)
+            request = format_pipeline_request(command_stack)
 
             try:
                 self.connection.write(request)
@@ -979,7 +1009,7 @@ class Pipeline(Client):
                     else:
                         response = yield self.process_data(data, cmd_line)
                     responses.append(response)
-                except Exception,e :
+                except Exception, e:
                     responses.append(e)
             self.connection.read_done()
 
@@ -995,7 +1025,7 @@ class Pipeline(Client):
             if self.transactional:
                 command_stack = command_stack[:-1]
                 responses = responses[-1] # actual data only from EXEC command
-                            #FIXME:  assert all other responses to be 'QUEUED'
+                #FIXME:  assert all other responses to be 'QUEUED'
                 log.info('responses %s', responses)
                 results = format_replies(command_stack[1:], responses)
                 log.info('results %s', results)
