@@ -480,7 +480,6 @@ class Client(object):
 
             yield self.connection.queue_wait()
             data = yield async(self.connection.readline)()
-            #            logging.debug("execute_command data = %r" % data)
             if not data:
                 result = None
                 self.connection.read_done()
@@ -489,10 +488,8 @@ class Client(object):
                 try:
                     response = yield self.process_data(data, cmd_line)
                     result = self.format_reply(cmd_line, response)
-                    print cmd_line, data, response
                 except RedisError as e:
                     result = e
-                #                logging.debug("READ DONE")
                 self.connection.read_done()
             ctx.ret_call(result)
 

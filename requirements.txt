@@ -1,2 +1,5 @@
 redis
 tornado==2.1
+unittest2
+nose
+mock
