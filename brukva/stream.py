@@ -51,24 +51,69 @@ class BrukvaStream(IOStream):
         elif self._read_multibulk_answers:
             _merge_prefix(self._read_buffer, sys.maxint)
             delimiter = '\r\n'
-            # multiple by two cause 1 answer assume to have two '\r\n'
-            chunks = self._read_buffer[0].split(delimiter, self._read_multibulk_answers*2)[:-1]
-            if chunks:
-                # but if answer is nil, then we got one '\r\n'
-                # so we must remove unnecessary chunks from next redis responses
-                nil_answers = 0
-                for chunk in chunks:
-                    if '$-1' in chunk:
-                        nil_answers += 1
-                chunks = chunks[:-nil_answers]
-                
-                chunks_str = delimiter.join(chunks)
-                callback = self._read_callback
-                self._read_multibulk_answers = None
-                self._read_callback = None
-                self._run_callback(callback, self._consume(len(chunks_str)+len(delimiter)))
-                return True
-            return False
+
+            remained_answers = self._read_multibulk_answers * 2
+            buffer = self._read_buffer[0]
+            chunks = []
+
+            if not buffer:
+                return False
+            
+            while True:
+                splitted_buffer = buffer.split(delimiter, 1)
+                if len(splitted_buffer) == 2:
+                    chunk, rest_buffer = splitted_buffer[0], splitted_buffer[1]
+                    if  chunk in ('+OK', '$-1') or chunk[0] in (':', '-'):
+                        remained_answers -= 2
+                    elif chunk[0]=='*':
+                        remained_answers += int(chunk[1])*2
+                        remained_answers -= 2
+                    else:
+                        remained_answers -= 1
+
+                    chunks.append(chunk)
+                    buffer = rest_buffer
+
+                    if remained_answers <=0:
+                        chunks_str = delimiter.join(chunks)
+                        callback = self._read_callback
+                        self._read_multibulk_answers = None
+                        self._read_callback = None
+                        self._run_callback(callback, self._consume(len(chunks_str)+len(delimiter)))
+                        return True
+                else:
+                    return False
+
+            # multiple by two cause 1 default single answer assume to have two '\r\n'
+#            chunks = self._read_buffer[0].split(delimiter, self._read_multibulk_answers*2)[:-1]
+#            chunks_str = delimiter.join(chunks)
+#            if chunks:
+#                # but if answer is ($-1, +OK, *3, :1, -ERR) then we got one '\r\n'
+#                # so we must remove unnecessary chunks from next redis responses
+#                num_chunks = self._read_multibulk_answers*2
+#                for index, chunk in enumerate(chunks):
+#                    if '$-1' in chunk or '+OK' in chunk or chunk[0] in (':', '-'):
+#                        num_chunks -= 2
+#                    elif chunk[0]=='*':
+#                        num_chunks += int(chunk[1])*2
+#                        num_chunks -= 2
+#                    else:
+#                        num_chunks -= 1
+#
+#                    if num_chunks<=0:
+#                        break
+#
+#                else:
+#                    self._consume(len(chunks_str)+len(delimiter))
+#
+#                chunks = chunks[:index]
+
+#                callback = self._read_callback
+#                self._read_multibulk_answers = None
+#                self._read_callback = None
+#                self._run_callback(callback, self._consume(len(chunks_str)+len(delimiter)))
+#                return True
+#            return False
 
         else:
             return super(BrukvaStream, self)._read_from_buffer()

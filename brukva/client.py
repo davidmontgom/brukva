@@ -134,7 +134,7 @@ class Connection(object):
         self._stream = None
         self._io_loop = io_loop
         self.try_left = 2
-        self._consume_buffer = None
+        self._consume_buffer = ""
 
         self.in_progress = False
         self.read_queue = []
@@ -184,8 +184,9 @@ class Connection(object):
 
             if self._consume_buffer:
             #                logging.debug("Consume buffer %r" % self._consume_buffer)
-                callback(self._consume_buffer[:length])
+                data = self._consume_buffer[:length]
                 self._consume_buffer = self._consume_buffer[length:]
+                callback(data)
             #                logging.debug("Consume buffer %r" % self._consume_buffer)
             else:
                 self._stream.read_bytes(length, callback)
@@ -198,15 +199,12 @@ class Connection(object):
             if not self._stream:
                 self.disconnect()
                 raise ConnectionError('Tried to read from non-existent connection')
-            #            logging.debug("Reading line")
 
             if self._consume_buffer:
-            #                logging.debug("Consume buffer %r" % self._consume_buffer)
-                data = self._consume_buffer.split('\r\n', 1)
-                assert len(data) != 1, 'Wrong buffer (no line delimeter) %r' % data
-                self._consume_buffer = data[1]
-                #                logging.debug("Consume buffer %r" % self._consume_buffer)
-                callback('\r\n'.join([data[0], '']))
+                splitted_buffer = self._consume_buffer.split('\r\n', 1)
+                line = splitted_buffer[0] + '\r\n'
+                self._consume_buffer = self._consume_buffer[len(line):]
+                callback(line)
             else:
                 self._stream.read_until('\r\n', callback)
         except IOError:
@@ -219,6 +217,20 @@ class Connection(object):
                 raise ConnectionError('Tried to read from non-existent connection')
             #            logging.debug("Reading %s lines" % num)
             self._stream.read_until_times('\r\n', num, callback)
+        except IOError:
+            self.on_disconnect()
+
+    def read_multibulk_reply(self, num_answers, callback):
+        try:
+            if not self._stream:
+                self.disconnect()
+                raise ConnectionError('Tried to read from non-existent connection')
+            logging.debug("Reading %s lines" % num_answers)
+            
+            if self._consume_buffer:
+                callback(self._consume_buffer)
+            else:
+                self._stream.read_multibulk(num_answers, callback)
         except IOError:
             self.on_disconnect()
 
@@ -480,6 +492,7 @@ class Client(object):
 
             yield self.connection.queue_wait()
             data = yield async(self.connection.readline)()
+            #            logging.debug("execute_command data = %r" % data)
             if not data:
                 result = None
                 self.connection.read_done()
@@ -490,6 +503,7 @@ class Client(object):
                     result = self.format_reply(cmd_line, response)
                 except RedisError as e:
                     result = e
+                #                logging.debug("READ DONE")
                 self.connection.read_done()
             ctx.ret_call(result)
 
@@ -498,6 +512,7 @@ class Client(object):
     def process_data(self, original_data, cmd_line, callback=None):
         logging.debug("Processing data %r" % original_data)
         with execution_context(callback) as ctx:
+
             data = original_data[:-2] # strip \r\n
 
             if data == '$-1':
@@ -507,6 +522,7 @@ class Client(object):
             else:
                 if not len(data):
                     raise IOError('Disconnected')
+
                 head, tail = data[0], data[1:]
 
                 if head == '*':
@@ -547,16 +563,18 @@ class Client(object):
     def _consume_multibulk(self, length, cmd_line, callback):
         with execution_context(callback) as ctx:
             tokens = []
-            data = yield async(self.connection.readlines)(length * 2)
+            data = yield async(self.connection.read_multibulk_reply)(length)
             #            logging.debug("Consume multibulk: %r" % data)
             if not data:
                 raise ResponseError(
                     'Not enough data in response to %s, accumulated tokens: %s' %
                     (cmd_line, tokens), cmd_line
                 )
-            self.set_consume_buffer(data)
+            
+            self.connection._consume_buffer = data
             while len(tokens) < length:
                 data = yield async(self.connection.readline)()
+                #                logging.debug("Consume multibulk: %s" % data)
                 if not data:
                     raise ResponseError(
                         'Not enough data in response to %s, accumulated tokens: %s' %
@@ -568,7 +586,7 @@ class Client(object):
 
     @async
     @process
-    def consume_bulk(self, length, callback):
+    def consume_bulk(self, length, callback, source=None):
     #        logging.debug("Consume bulk length %s" % length)
         with execution_context(callback) as ctx:
             data = yield async(self.connection.read)(length)
@@ -944,9 +962,6 @@ class Client(object):
 
     def unwatch(self, callbacks=None):
         self.execute_command('UNWATCH', callbacks)
-
-    def set_consume_buffer(self, data):
-        self.connection._consume_buffer = data
 
 
 class Pipeline(Client):

@@ -433,7 +433,9 @@ class ServerCommandsTestCase(TornadoTestCase):
         self.client.set('score:1', 8, callbacks=self.expect(True))
         self.client.set('score:2', 3, callbacks=self.expect(True))
         self.client.set('score:3', 5, callbacks=self.expect(True))
-        make_list('a_values', '123')
+
+        make_list('a_values', '123', False)
+
         self.client.sort('a_values', by='score:*', callbacks=self.expect(['2', '3', '1']))
 
         self.client.set('user:1', 'u1', callbacks=self.expect(True))
@@ -451,7 +453,8 @@ class ServerCommandsTestCase(TornadoTestCase):
 
         make_list('a', '231')
         self.client.sort('a', store='sorted_values', callbacks=self.expect(3))
-        self.client.lrange('a', 0, -1, callbacks=self.expect(['1', '2', '3']))
+#        self.client.lrange('a', 0, -1, callbacks=self.expect(['1', '2', '3']))
+        self.client.lrange('a', 0, -1, callbacks=self.expect(['2', '3', '1']))
 
         self.client.set('user:1:username', 'zeus')
         self.client.set('user:2:username', 'titan')
@@ -488,8 +491,35 @@ class ServerCommandsTestCase(TornadoTestCase):
         self.start()
 
 
-
 class PipelineTestCase(TornadoTestCase):
+
+    def test_pipe_zsets(self):
+        pipe = self.client.pipeline(transactional=True)
+
+        pipe.zadd('foo', 1, 'a')
+        pipe.zadd('foo', 2, 'b')
+        pipe.zscore('foo', 'a')
+        pipe.zscore('foo', 'b' )
+        pipe.zrank('foo', 'a', )
+        pipe.zrank('foo', 'b', )
+
+        pipe.zrange('foo', 0, -1, True )
+        pipe.zrange('foo', 0, -1, False)
+
+        pipe.execute([
+            self.pexpect([
+                1, 1,
+                1, 2,
+                0, 1,
+                [('a', 1.0), ('b', 2.0)],
+                ['a', 'b'],
+            ]),
+            self.finish,
+        ])
+        self.start()
+
+
+class _PipelineTestCase(TornadoTestCase):
     ### Pipeline ###
     def test_pipe_simple(self):
         pipe = self.client.pipeline()
