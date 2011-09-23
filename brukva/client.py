@@ -546,23 +546,6 @@ class Client(object):
     def consume_multibulk(self, length, cmd_line, callback):
         with execution_context(callback) as ctx:
             tokens = []
-            while len(tokens) < length:
-                data = yield async(self.connection.readline)()
-                #                logging.debug("Consume multibulk: %s" % data)
-                if not data:
-                    raise ResponseError(
-                        'Not enough data in response to %s, accumulated tokens: %s' %
-                        (cmd_line, tokens), cmd_line
-                    )
-                token = yield self.process_data(data, cmd_line) #FIXME error
-                tokens.append(token)
-            ctx.ret_call(tokens)
-
-    @async
-    @process
-    def _consume_multibulk(self, length, cmd_line, callback):
-        with execution_context(callback) as ctx:
-            tokens = []
             data = yield async(self.connection.read_multibulk_reply)(length)
             #            logging.debug("Consume multibulk: %r" % data)
             if not data:

@@ -141,7 +141,7 @@ class ServerCommandsTestCase(TornadoTestCase):
         self.client.dbsize([self.expect(2), self.finish])
         self.start()
 
-    def _test_save(self):
+    def test_save(self):
         self.client.save(self.expect(True))
         now = datetime.now().replace(microsecond=0)
         self.client.lastsave([self.expect(lambda d: d >= now), self.finish])
@@ -492,34 +492,6 @@ class ServerCommandsTestCase(TornadoTestCase):
 
 
 class PipelineTestCase(TornadoTestCase):
-
-    def test_pipe_zsets(self):
-        pipe = self.client.pipeline(transactional=True)
-
-        pipe.zadd('foo', 1, 'a')
-        pipe.zadd('foo', 2, 'b')
-        pipe.zscore('foo', 'a')
-        pipe.zscore('foo', 'b' )
-        pipe.zrank('foo', 'a', )
-        pipe.zrank('foo', 'b', )
-
-        pipe.zrange('foo', 0, -1, True )
-        pipe.zrange('foo', 0, -1, False)
-
-        pipe.execute([
-            self.pexpect([
-                1, 1,
-                1, 2,
-                0, 1,
-                [('a', 1.0), ('b', 2.0)],
-                ['a', 'b'],
-            ]),
-            self.finish,
-        ])
-        self.start()
-
-
-class _PipelineTestCase(TornadoTestCase):
     ### Pipeline ###
     def test_pipe_simple(self):
         pipe = self.client.pipeline()
@@ -724,9 +696,9 @@ class AsyncWrapperTestCase(TornadoTestCase):
 
 
 class ReconnectTestCase(TornadoTestCase):
-    def _test_redis_timeout(self):
+    def test_redis_timeout(self):
         self.client.set('foo', 'bar', self.expect(True))
-        self.delayed(10, lambda:
+        self.delayed(3, lambda:
             self.client.get('foo', [
                 self.expect('bar'),
                 self.finish
@@ -734,12 +706,12 @@ class ReconnectTestCase(TornadoTestCase):
         )
         self.start()
 
-    def _test_redis_timeout_with_pipe(self):
+    def test_redis_timeout_with_pipe(self):
         self.client.set('foo', 'bar', self.expect(True))
         pipe = self.client.pipeline(transactional=True)
         pipe.get('foo')
 
-        self.delayed(10, lambda:
+        self.delayed(3, lambda:
             pipe.execute([
                 self.pexpect([
                     'bar',
