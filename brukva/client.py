@@ -183,11 +183,9 @@ class Connection(object):
                 raise ConnectionError('Tried to read from non-existent connection')
 
             if self._consume_buffer:
-            #                logging.debug("Consume buffer %r" % self._consume_buffer)
                 data = self._consume_buffer[:length]
                 self._consume_buffer = self._consume_buffer[length:]
                 callback(data)
-            #                logging.debug("Consume buffer %r" % self._consume_buffer)
             else:
                 self._stream.read_bytes(length, callback)
 
@@ -215,7 +213,6 @@ class Connection(object):
             if not self._stream:
                 self.disconnect()
                 raise ConnectionError('Tried to read from non-existent connection')
-            #            logging.debug("Reading %s lines" % num)
             self._stream.read_until_times('\r\n', num, callback)
         except IOError:
             self.on_disconnect()
@@ -225,8 +222,7 @@ class Connection(object):
             if not self._stream:
                 self.disconnect()
                 raise ConnectionError('Tried to read from non-existent connection')
-            logging.debug("Reading %s lines" % num_answers)
-            
+
             if self._consume_buffer:
                 callback(self._consume_buffer)
             else:
@@ -237,20 +233,16 @@ class Connection(object):
     def try_to_perform_read(self):
         # have callbacks in queue and process no started
         if not self.in_progress and self.read_queue:
-        #            logging.debug("Try to perform read, adding callback to ioloop")
             self.in_progress = True
             # execute oldest callback on next ioloop iteration, with result = None
             self._io_loop.add_callback(partial(self.read_queue.pop(0), None))
-        #        logging.debug("Try to perform read, fail!")
 
     @async
     def queue_wait(self, callback=None):
-    #        logging.debug("Queue wait")
         self.read_queue.append(callback)
         self.try_to_perform_read()
 
     def read_done(self):
-    #        logging.debug("Read done function")
         self.in_progress = False
         self.try_to_perform_read()
 
@@ -492,7 +484,6 @@ class Client(object):
 
             yield self.connection.queue_wait()
             data = yield async(self.connection.readline)()
-            #            logging.debug("execute_command data = %r" % data)
             if not data:
                 result = None
                 self.connection.read_done()
@@ -503,14 +494,12 @@ class Client(object):
                     result = self.format_reply(cmd_line, response)
                 except RedisError as e:
                     result = e
-                #                logging.debug("READ DONE")
                 self.connection.read_done()
             ctx.ret_call(result)
 
     @async
     @process
     def process_data(self, original_data, cmd_line, callback=None):
-        logging.debug("Processing data %r" % original_data)
         with execution_context(callback) as ctx:
 
             data = original_data[:-2] # strip \r\n
@@ -547,7 +536,6 @@ class Client(object):
         with execution_context(callback) as ctx:
             tokens = []
             data = yield async(self.connection.read_multibulk_reply)(length)
-            #            logging.debug("Consume multibulk: %r" % data)
             if not data:
                 raise ResponseError(
                     'Not enough data in response to %s, accumulated tokens: %s' %
@@ -557,7 +545,6 @@ class Client(object):
             self.connection._consume_buffer = data
             while len(tokens) < length:
                 data = yield async(self.connection.readline)()
-                #                logging.debug("Consume multibulk: %s" % data)
                 if not data:
                     raise ResponseError(
                         'Not enough data in response to %s, accumulated tokens: %s' %
@@ -569,11 +556,9 @@ class Client(object):
 
     @async
     @process
-    def consume_bulk(self, length, callback, source=None):
-    #        logging.debug("Consume bulk length %s" % length)
+    def consume_bulk(self, length, callback):
         with execution_context(callback) as ctx:
             data = yield async(self.connection.read)(length)
-            #            logging.debug("Consume bulk: %r" % data)
             if isinstance(data, Exception):
                 raise data
             if not data:
@@ -581,7 +566,6 @@ class Client(object):
             else:
                 data = data[:-2]
             ctx.ret_call(data)
-            ####
 
     ### MAINTENANCE
     def bgrewriteaof(self, callbacks=None):
