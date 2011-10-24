@@ -8,33 +8,83 @@ import weakref
 
 
 from tornado.ioloop import IOLoop
-from tornado.iostream import IOStream
 from adisp import async, process
 
 from datetime import datetime
-from brukva.exceptions import RedisError, RequestError, \
-    ConnectionError, ResponseError, InvalidResponse, InternalRedisError
 from brukva.utils import execution_context
 from brukva.pool import ConnectionPool
+from brukva.exceptions import  ConnectionError, ResponseError, RedisError
+from brukva.stream import BrukvaStream
 
 log = logging.getLogger('brukva.client')
 log_blob = logging.getLogger('brukva.client.blob')
 
+class ExecutionContext(object):
+    def __init__(self, callbacks, error_wrapper=None):
+        self.callbacks = callbacks
+        self.error_wrapper = error_wrapper
+        self.is_active = True
 
-class Message(object):
-    def __init__(self, kind, channel, body):
-        self.kind = kind
-        self.channel = channel
-        self.body = body
+    def _call_callbacks(self, callbacks, value):
+        if callbacks:
+            if isinstance(callbacks, Iterable):
+                for cb in callbacks:
+                    cb(value)
+            else:
+                callbacks(value)
 
-    def __unicode__(self):
-        return u'<PubSub %s on channel %s: %s >' % (self.kind, self.channel, self.body)
+    def __enter__(self):
+        return self
 
-    def __str__(self):
-        return '<PubSub %s on channel %s: %s >' % (self.kind, self.channel, self.body)
+    def __exit__(self, type_, value, tb):
+        if type_ is None:
+            return True
 
-    def __repr__(self):
-        return repr(str(self))
+        if self.error_wrapper:
+            value = self.error_wrapper(value)
+        else:
+            value = value or Exception(
+                'Strange exception with None value type: %s; tb: %s' %
+                (type_, '\n'.join(traceback.format_tb(tb))
+                    ))
+
+        if self.is_active:
+            log.error(value, exc_info=(type_, value, tb))
+            self.ret_call(value)
+            return True
+        else:
+            return False
+
+    def disable(self):
+        self.is_active = False
+
+    def enable(self):
+        self.is_active = True
+
+    def ret_call(self, value):
+        self.is_active = False
+        self._call_callbacks(self.callbacks, value)
+        self.is_active = True
+
+    def safe_call(self, callbacks, value):
+        self.is_active = False
+        self._call_callbacks(callbacks, value)
+        self.is_active = True
+
+
+def execution_context(callbacks, error_wrapper=None):
+    """
+    Syntax sugar.
+    If some error occurred inside with block,
+    it will be suppressed and forwarded to callbacks.
+
+    Use contex.ret_call(value) method to call callbacks.
+
+    @type callbacks: callable or iterator over callables
+    @rtype: context
+    """
+    return ExecutionContext(callbacks, error_wrapper)
+
 
 class CmdLine(object):
     def __init__(self, cmd, *args, **kwargs):
@@ -43,23 +93,27 @@ class CmdLine(object):
         self.kwargs = kwargs
 
     def __repr__(self):
-        return self.cmd + '(' + str(self.args)  + ',' + str(self.kwargs) + ')'
+        return self.cmd + '(' + str(self.args) + ',' + str(self.kwargs) + ')'
+
 
 def string_keys_to_dict(key_string, callback):
     return dict([(key, callback) for key in key_string.split()])
+
 
 def dict_merge(*dicts):
     merged = {}
     [merged.update(d) for d in dicts]
     return merged
 
+
 def encode(value):
     if isinstance(value, str):
         return value
     elif isinstance(value, unicode):
         return value.encode('utf-8')
-    # pray and hope
+        # pray and hope
     return str(value)
+
 
 def format(*tokens):
     cmds = []
@@ -67,6 +121,7 @@ def format(*tokens):
         e_t = encode(t)
         cmds.append('$%s\r\n%s\r\n' % (len(e_t), e_t))
     return '*%s\r\n%s' % (len(tokens), ''.join(cmds))
+
 
 def format_pipeline_request(command_stack):
     """
@@ -76,45 +131,182 @@ def format_pipeline_request(command_stack):
     """
     return ''.join(format(c.cmd, *c.args, **c.kwargs) for c in command_stack)
 
+class Connection(object):
+    def __init__(self, host, port, on_connect, on_disconnect, timeout=None, io_loop=None):
+        self.host = host
+        self.port = port
+        self.on_connect = on_connect
+        self.on_disconnect = on_disconnect
+        self.timeout = timeout
+        self._stream = None
+        self._io_loop = io_loop
+        self.try_left = 2
+        self._consume_buffer = ""
+
+        self.in_progress = False
+        self.read_queue = []
+
+    def connect(self):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+            sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
+            sock.settimeout(self.timeout)
+            sock.connect((self.host, self.port))
+            self._stream = BrukvaStream(sock, io_loop=self._io_loop)
+            self.connected()
+        except socket.error, e:
+            raise ConnectionError(str(e))
+        self.on_connect()
+
+    def disconnect(self):
+        if self._stream:
+            try:
+                self._stream.close()
+            except socket.error, e:
+                pass
+            self._stream = None
+
+    def write(self, data, try_left=None):
+        if try_left is None:
+            try_left = self.try_left
+        if not self._stream:
+            self.connect()
+            if not self._stream:
+                raise ConnectionError('Tried to write to non-existent connection')
+
+        if try_left > 0:
+            try:
+                self._stream.write(data)
+            except IOError:
+                self.disconnect()
+                self.write(data, try_left - 1)
+        else:
+            raise ConnectionError('Tried to write to non-existent connection')
+
+    def read(self, length, callback):
+        try:
+            if not self._stream:
+                self.disconnect()
+                raise ConnectionError('Tried to read from non-existent connection')
+
+            if self._consume_buffer:
+                data = self._consume_buffer[:length]
+                self._consume_buffer = self._consume_buffer[length:]
+                callback(data)
+            else:
+                self._stream.read_bytes(length, callback)
+
+        except IOError:
+            self.on_disconnect()
+
+    def readline(self, callback):
+        try:
+            if not self._stream:
+                self.disconnect()
+                raise ConnectionError('Tried to read from non-existent connection')
+
+            if self._consume_buffer:
+                splitted_buffer = self._consume_buffer.split('\r\n', 1)
+                line = splitted_buffer[0] + '\r\n'
+                self._consume_buffer = self._consume_buffer[len(line):]
+                callback(line)
+            else:
+                self._stream.read_until('\r\n', callback)
+        except IOError:
+            self.on_disconnect()
+
+    def readlines(self, num, callback):
+        try:
+            if not self._stream:
+                self.disconnect()
+                raise ConnectionError('Tried to read from non-existent connection')
+            self._stream.read_until_times('\r\n', num, callback)
+        except IOError:
+            self.on_disconnect()
+
+    def read_multibulk_reply(self, num_answers, callback):
+        try:
+            if not self._stream:
+                self.disconnect()
+                raise ConnectionError('Tried to read from non-existent connection')
+
+            if self._consume_buffer:
+                callback(self._consume_buffer)
+            else:
+                self._stream.read_multibulk(num_answers, callback)
+        except IOError:
+            self.on_disconnect()
+
+    def try_to_perform_read(self):
+        # have callbacks in queue and process no started
+        if not self.in_progress and self.read_queue:
+            self.in_progress = True
+            # execute oldest callback on next ioloop iteration, with result = None
+            self._io_loop.add_callback(partial(self.read_queue.pop(0), None))
+
+    @async
+    def queue_wait(self, callback=None):
+        self.read_queue.append(callback)
+        self.try_to_perform_read()
+
+    def read_done(self):
+        self.in_progress = False
+        self.try_to_perform_read()
+
+    def connected(self):
+        if self._stream:
+            return True
+        return False
+
+
 def reply_to_bool(r, *args, **kwargs):
     return bool(r)
+
 
 def make_reply_assert_msg(msg):
     def reply_assert_msg(r, *args, **kwargs):
         return r == msg
+
     return reply_assert_msg
+
 
 def reply_set(r, *args, **kwargs):
     return set(r)
 
+
 def reply_dict_from_pairs(r, *args, **kwargs):
     return dict(izip(r[::2], r[1::2]))
+
 
 def reply_str(r, *args, **kwargs):
     return r or ''
 
+
 def reply_int(r, *args, **kwargs):
     return int(r) if r is not None else None
+
 
 def reply_float(r, *args, **kwargs):
     return float(r) if r is not None else None
 
+
 def reply_datetime(r, *args, **kwargs):
     return datetime.fromtimestamp(int(r))
 
-def reply_pubsub_message(r, *args, **kwargs):
-    return Message(*r)
 
 def reply_zset(r, *args, **kwargs):
     if (not r ) or (not 'WITHSCORES' in args):
         return r
     return zip(r[::2], map(float, r[1::2]))
 
+
 def reply_hmget(r, key, *fields, **kwargs):
     return dict(zip(fields, r))
 
+
 def reply_info(response):
     info = {}
+
     def get_value(value):
         if ',' not in value:
             return value
@@ -126,6 +318,7 @@ def reply_info(response):
             except ValueError:
                 sub_dict[k] = v
         return sub_dict
+
     for line in response.splitlines():
         key, value = line.split(':')
         try:
@@ -134,15 +327,10 @@ def reply_info(response):
             info[key] = get_value(value)
     return info
 
+
 def reply_ttl(r, *args, **kwargs):
     return r != -1 and r or None
 
-
-PUB_SUB_COMMANDS = set([
-    'SUBSCRIBE',
-    'UNSUBSCRIBE',
-    'LISTEN',
-])
 
 class _AsyncWrapper(object):
     def __init__(self, obj):
@@ -151,13 +339,18 @@ class _AsyncWrapper(object):
 
     def __getattr__(self, item):
         if item not in self.memoized:
-            self.memoized[item] = async(getattr(self.obj, item), cbname='callbacks')
+            if getattr(self.obj, 'yield_mode'):
+                self.memoized[item] = getattr(self.obj, item)
+            else:
+                self.memoized[item] = async(getattr(self.obj, item), cbname='callbacks')
         return self.memoized[item]
 
 
 class Client(object):
     def __init__(self, host='localhost', port=6379, password=None,
-            selected_db=None, io_loop=None):
+                 selected_db=None, io_loop=None, yield_mode=False):
+        self.yield_mode = yield_mode
+        self.memoized = {}
         self._io_loop = io_loop or IOLoop.instance()
         self.host = host
         self.port = port
@@ -172,42 +365,56 @@ class Client(object):
         )
 
         self.async = _AsyncWrapper(weakref.proxy(self))
+
         self.queue = []
         self.current_cmd_line = None
-        self.subscribed = False
         self.password = password
         self.selected_db = selected_db
         self.REPLY_MAP = dict_merge(
-                string_keys_to_dict('AUTH BGREWRITEAOF BGSAVE DEL EXISTS EXPIRE HDEL HEXISTS '
-                                    'HMSET MOVE MSET MSETNX SAVE SETNX',
-                                    reply_to_bool),
-                string_keys_to_dict('FLUSHALL FLUSHDB SELECT SET SETEX SHUTDOWN '
-                                    'RENAME RENAMENX WATCH UNWATCH',
-                                    make_reply_assert_msg('OK')),
-                string_keys_to_dict('SMEMBERS SINTER SUNION SDIFF',
-                                    reply_set),
-                string_keys_to_dict('HGETALL BRPOP BLPOP',
-                                    reply_dict_from_pairs),
-                string_keys_to_dict('HGET',
-                                    reply_str),
-                string_keys_to_dict('SUBSCRIBE UNSUBSCRIBE LISTEN',
-                                    reply_pubsub_message),
-                string_keys_to_dict('ZRANK ZREVRANK',
-                                    reply_int),
-                string_keys_to_dict('ZSCORE ZINCRBY ZCOUNT ZCARD',
-                                    reply_int),
-                string_keys_to_dict('ZRANGE ZRANGEBYSCORE ZREVRANGE',
-                                    reply_zset),
+            string_keys_to_dict('AUTH BGREWRITEAOF BGSAVE DEL EXISTS EXPIRE HDEL HEXISTS '
+                                'HMSET MOVE MSET MSETNX SAVE SETNX',
+                                reply_to_bool),
+            string_keys_to_dict('FLUSHALL FLUSHDB SELECT SET SETEX SHUTDOWN '
+                                'RENAME RENAMENX WATCH UNWATCH',
+                                make_reply_assert_msg('OK')),
+            string_keys_to_dict('SMEMBERS SINTER SUNION SDIFF',
+                                reply_set),
+            string_keys_to_dict('HGETALL BRPOP BLPOP',
+                                reply_dict_from_pairs),
+            string_keys_to_dict('HGET',
+                                reply_str),
+            string_keys_to_dict('ZRANK ZREVRANK',
+                                reply_int),
+            string_keys_to_dict('ZSCORE ZINCRBY ZCOUNT ZCARD',
+                                reply_int),
+            string_keys_to_dict('ZRANGE ZRANGEBYSCORE ZREVRANGE',
+                                reply_zset),
+            string_keys_to_dict('LLEN', reply_int),
                 {'HMGET': reply_hmget},
                 {'PING': make_reply_assert_msg('PONG')},
-                {'LASTSAVE': reply_datetime },
-                {'TTL': reply_ttl } ,
+                {'LASTSAVE': reply_datetime},
+                {'TTL': reply_ttl},
                 {'INFO': reply_info},
                 {'MULTI_PART': make_reply_assert_msg('QUEUED')},
             )
 
         self._waiting_callbacks = defaultdict(list)
         self._pipeline = None
+
+    def __getattribute__(self, name):
+        """
+        Allow to remove AsyncWrapper from chain of calls
+        """
+        attr = super(Client, self).__getattribute__(name)
+        if super(Client, self).__getattribute__('yield_mode'):
+            func_name = getattr(attr, 'func_name', None)
+            if func_name:
+                if 'callbacks' in attr.func_code.co_varnames:
+                    memoized = super(Client, self).__getattribute__('memoized')
+                    if name not in memoized:
+                        memoized[name] = async(attr, cbname='callbacks')
+                    return memoized[name]
+        return attr
 
     def __repr__(self):
         return '<Brukva client %s:%s>' % (self.host, self.port)
@@ -236,9 +443,8 @@ class Client(object):
         #self.connection.disconnect()
 
     def on_disconnect(self):
-        if self.subscribed:
-            self.subscribed = False
         raise ConnectionError("Socket closed on remote end")
+
     ####
 
     #### formatting
@@ -247,7 +453,7 @@ class Client(object):
             return value
         elif isinstance(value, unicode):
             return value.encode('utf-8')
-        # pray and hope
+            # pray and hope
         return str(value)
 
     def format(self, *tokens):
@@ -261,13 +467,14 @@ class Client(object):
         if cmd_line.cmd not in self.REPLY_MAP:
             return data
         try:
-            res =  self.REPLY_MAP[cmd_line.cmd](data, *cmd_line.args, **cmd_line.kwargs)
+            res = self.REPLY_MAP[cmd_line.cmd](data, *cmd_line.args, **cmd_line.kwargs)
         except Exception, e:
             raise ResponseError(
                 'failed to format reply to %s, raw data: %s; err message: %s' %
                 (cmd_line, data, e), cmd_line
             )
         return res
+
     ####
 
     #### new AsIO
@@ -322,26 +529,10 @@ class Client(object):
             elif not hasattr(callbacks, '__iter__'):
                 callbacks = [callbacks]
 
-            if self.subscribed and cmd not in PUB_SUB_COMMANDS:
-                ctx.ret_call(RequestError('Calling not pub/sub command during subscribed state', cmd_line))
-                return
-
             log_blob.debug('try to get connection for %s',  cmd_line)
             connection = yield async(self.connection_pool.request_connection)()
-            log_blob.debug('got connection %s for %s cmd_line',
-                connection.idx, cmd_line)
-            try:
-                write_res = yield async(connection.write)(self.format(cmd, *args, **kwargs))
-            except Exception, e:
-                connection.disconnect()
-                raise e
-            if isinstance(write_res, Exception):
-                raise write_res
-
-            #if self.subscribed and cmd in ('SUBSCRIBE', 'UNSUBSCRIBE'):
-            #    self._waiting_callbacks[cmd].append(callbacks)
-            #    return
-
+            log_blob.debug('got connection %s for %s cmd_line',connection.idx, cmd_line)
+            
             try:
                 data = yield async(connection.readline)()
                 if not data:
@@ -358,15 +549,17 @@ class Client(object):
     @process
     def process_data(self, connection, data, cmd_line, callback):
         with execution_context(callback) as ctx:
-            data = data[:-2] # strip \r\n
+
+            data = original_data[:-2] # strip \r\n
 
             if data == '$-1':
-                response =  None
+                response = None
             elif data == '*0' or data == '*-1':
                 response = []
             else:
-                if len(data) == 0:
+                if not len(data):
                     raise IOError('Disconnected')
+
                 head, tail = data[0], data[1:]
 
                 if head == '*':
@@ -390,16 +583,24 @@ class Client(object):
     def consume_multibulk(self, connection, length, cmd_line, callback):
         with execution_context(callback) as ctx:
             tokens = []
+            data = yield async(self.connection.read_multibulk_reply)(length)
+            if not data:
+                raise ResponseError(
+                    'Not enough data in response to %s, accumulated tokens: %s' %
+                    (cmd_line, tokens), cmd_line
+                )
+            
+            self.connection._consume_buffer = data
             while len(tokens) < length:
                 data = yield async(connection.readline)()
                 if not data:
                     raise ResponseError(
-                        'Not enough data in response to %s, accumulated tokens: %s'%
+                        'Not enough data in response to %s, accumulated tokens: %s' %
                         (cmd_line, tokens), cmd_line
                     )
                 token = yield self.process_data(connection, data, cmd_line) #FIXME error
                 tokens.append( token )
-
+                
             ctx.ret_call(tokens)
 
     @async
@@ -492,12 +693,12 @@ class Client(object):
 
     def mset(self, mapping, callbacks=None):
         items = []
-        [ items.extend(pair) for pair in mapping.iteritems() ]
+        [items.extend(pair) for pair in mapping.iteritems()]
         self.execute_command('MSET', callbacks, *items)
 
     def msetnx(self, mapping, callbacks=None):
         items = []
-        [ items.extend(pair) for pair in mapping.iteritems() ]
+        [items.extend(pair) for pair in mapping.iteritems()]
         self.execute_command('MSETNX', callbacks, *items)
 
     def get(self, key, callbacks=None):
@@ -732,11 +933,14 @@ class Client(object):
 
     def hmset(self, key, mapping, callbacks=None):
         items = []
-        [ items.extend(pair) for pair in mapping.iteritems() ]
+        [items.extend(pair) for pair in mapping.iteritems()]
         self.execute_command('HMSET', callbacks, key, *items)
 
     def hset(self, key, field, value, callbacks=None):
         self.execute_command('HSET', callbacks, key, field, value)
+
+    def hsetnx(self, key, field, value, callbacks=None):
+        self.execute_command('HSETNX', callbacks, key, field, value)
 
     def hget(self, key, field, callbacks=None):
         self.execute_command('HGET', callbacks, key, field)
@@ -762,80 +966,13 @@ class Client(object):
     def hvals(self, key, callbacks=None):
         self.execute_command('HVALS', callbacks, key)
 
-    ### PUBSUB
-    def subscribe(self, channels, callbacks=None):
-        callbacks = callbacks or []
-        if not isinstance(callbacks, Iterable):
-            callbacks = [callbacks]
-        if isinstance(channels, basestring):
-            channels = [channels]
-        if not self.subscribed:
-            callbacks = list(callbacks) + [self.on_subscribed]
-        self.execute_command('SUBSCRIBE', callbacks, *channels)
-
-    def on_subscribed(self, result):
-        self.subscribed = True
-
-    def unsubscribe(self, channels, callbacks=None):
-        callbacks = callbacks or []
-        if not isinstance(callbacks, Iterable):
-            callbacks = [callbacks]
-        if isinstance(channels, basestring):
-            channels = [channels]
-        callbacks = list(callbacks)
-        self.execute_command('UNSUBSCRIBE', callbacks, *channels)
-
-    def on_unsubscribed(self, *args, **kwargs):
-        self.subscribed = False
-
-    def publish(self, channel, message, callbacks=None):
-        self.execute_command('PUBLISH', callbacks, channel, message)
-
-    @process
-    def _listen(self, callbacks=None):
-        # 'LISTEN' is just for receiving information, it is not actually sent anywhere
-        def error_wrapper(e):
-            if isinstance(e, GeneratorExit):
-                return ConnectionError('Connection lost')
-            else:
-                return e
-
-        with execution_context(callbacks, error_wrapper) as ctx:
-            callbacks = callbacks or []
-            if not hasattr(callbacks, '__iter__'):
-                callbacks = [callbacks]
-            yield self.connection.queue_wait()
-
-            cmd_listen = CmdLine('LISTEN')
-            while self.subscribed:
-                data = yield async(self.connection.readline)()
-                if isinstance(data, Exception):
-                    raise data
-
-                response = yield self.process_data(data, cmd_listen)
-                if isinstance(response, Exception):
-                    raise response
-
-                result = self.format_reply(cmd_listen, response)
-
-                if result.kind != 'message':
-                    waiting_stack = self._waiting_callbacks[result.kind.upper()]
-                    if len(waiting_stack) > 0:
-                        ctx.safe_call(waiting_stack.pop(0), result)
-
-                    if result.kind == 'unsubscribe' and result.body == 0:
-                        self.on_unsubscribed()
-                        self.connection.read_done()
-                        break
-                else:
-                    ctx.ret_call(result)
-
     ### CAS
     def watch(self, key, callbacks=None):
         self.execute_command('WATCH', callbacks, key)
 
     def unwatch(self, callbacks=None):
         self.execute_command('UNWATCH', callbacks)
+
 
 class Pipeline(Client):
     def __init__(self, transactional, *args, **kwargs):
@@ -844,9 +981,6 @@ class Pipeline(Client):
         self.command_stack = []
 
     def execute_command(self, cmd, callbacks, *args, **kwargs):
-        if cmd in PUB_SUB_COMMANDS:
-            raise RequestError(
-                'Client is not supposed to issue command %s in pipeline' % cmd)
         self.command_stack.append(CmdLine(cmd, *args, **kwargs))
 
     def discard(self): # actually do nothing with redis-server, just flush command_stack
@@ -870,8 +1004,7 @@ class Pipeline(Client):
 
             log_blob.debug('try to get connection for %r', request)
             connection = yield async(self.connection_pool.request_connection)()
-            log_blob.debug('got connection %s for %r request', \
-                connection.idx, request)
+            log_blob.debug('got connection %s for %r request', connection.idx, request)
             try:
                 write_res = yield async(connection.write)(request)
                 log_blob.debug('conn  write res: %r', write_res)
@@ -912,7 +1045,8 @@ class Pipeline(Client):
             if self.transactional:
                 command_stack = command_stack[:-1]
                 responses = responses[-1] # actual data only from EXEC command
-                            #FIXME:  assert all other responses to be 'QUEUED'
+                #FIXME:  assert all other responses to be 'QUEUED'
+                log.info('responses %s', responses)
                 results = format_replies(command_stack[1:], responses)
                 log_blob.debug('on request %r pipe results %s', request, results)
             else:

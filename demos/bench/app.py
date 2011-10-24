@@ -9,7 +9,6 @@ REDIS_HOST = 'localhost'
 REDIS_PORT = 6379
 
 r = redis.Redis(REDIS_HOST, REDIS_PORT, db=9)
-
 c = brukva.Client(REDIS_HOST, REDIS_PORT)
 c.connect()
 c.select(9)

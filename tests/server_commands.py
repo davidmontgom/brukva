@@ -601,7 +601,6 @@ class ServerCommandsTestCase(TornadoTestCase):
         ])
         self._run_plan(test_plan)
 
-
 class PipelineTestCase(TornadoTestCase):
     ### Pipeline ###
     def test_pipe_simple(self):
@@ -765,107 +764,6 @@ class PipelineTestCase(TornadoTestCase):
         self.client.llen('foo', [self.expect(ResponseError), self.finish])
         self.start()
 
-class PubSubTestCase(TornadoTestCase):
-    def setUp(self, *args, **kwargs):
-        super(PubSubTestCase, self).setUp(*args, **kwargs)
-        self.client2 = brukva.Client(selected_db=9, io_loop=self.loop)
-        self.client2.connection.connect()
-        #self.client2.select(9)
-
-    def tearDown(self):
-        super(PubSubTestCase, self).tearDown()
-        #del self.client2
-
-    def assert_pubsub(self, msg, kind, channel, body):
-        self.assertEqual(msg.kind, kind)
-        self.assertEqual(msg.channel, channel)
-        self.assertEqual(msg.body, body)
-
-    def test_pub_sub(self):
-        def on_recv(msg):
-            self.assert_pubsub(msg, 'message', 'foo', 'bar')
-
-        def on_subscription(msg):
-            self.assert_pubsub(msg, 'subscribe', 'foo', 1)
-            self.client2.listen(on_recv)
-
-        self.client2.subscribe('foo', on_subscription)
-        self.delayed(0.1, lambda:
-            self.client2.set('gtx', 'rd', self.expect(RequestError)))
-        self.delayed(0.2, lambda:
-            self.client.publish('foo', 'bar',
-                lambda *args: self.delayed(0.4, self.finish))
-        )
-        self.start()
-
-    def test_unsubscribe(self):
-        global c
-        c = 0
-        def on_recv(msg):
-            if isinstance(msg, Exception):
-                self.fail('Got unexpected exception: %s' % msg)
-
-            global c
-            if c == 0:
-                self.assert_pubsub(msg, 'message', 'foo', 'bar')
-            elif c == 1:
-                self.assert_pubsub(msg, 'message', 'so', 'much')
-            c += 1
-
-        def on_subscription(msg):
-            self.assert_pubsub(msg, 'subscribe', 'foo', 1)
-            self.client2.listen(on_recv)
-
-        self.client2.subscribe('foo', on_subscription)
-        self.delayed(0.1, lambda: self.client.publish('foo', 'bar'))
-        self.delayed(0.2, lambda: self.client2.subscribe('so',))
-        self.delayed(0.3, lambda: self.client2.unsubscribe('foo'))
-        self.delayed(0.4, lambda: self.client.publish('so', 'much'))
-        self.delayed(0.5, lambda: self.client2.unsubscribe('so'))
-        self.delayed(0.6, lambda: self.client2.set('zar', 'xar', [self.expect(True), self.finish]))
-        self.start()
-
-
-    def test_pub_sub_disconnect(self):
-        def on_recv(msg):
-            self.assertIsInstance(msg, brukva.exceptions.ConnectionError)
-
-        def on_subscription(msg):
-            self.assertEqual(msg.kind, 'subscribe')
-            self.assertEqual(msg.channel, 'foo')
-            self.assertEqual(msg.body, 1)
-            self.client2.listen(on_recv)
-
-        def on_publish(value):
-            self.assertIsNotNone(value)
-
-        self.client2.subscribe('foo', on_subscription)
-        self.delayed(0.2, lambda: self.client2.disconnect())
-        self.delayed(0.2, lambda: self.client.publish('foo', 'zar', on_publish))
-        self.delayed(0.4, lambda: self.client2.publish('foo', 'bar', on_publish))
-        self.delayed(0.5, self.finish)
-        self.start()
-
-    def test_generator_exit(self):
-        def on_recv(msg):
-            print msg
-            #if msg.body == 'b':
-                #raise Exception('Oops')
-
-        def on_subs(msg):
-            self.client2.listen(on_recv)
-
-        def dl():
-            del self.client2
-
-        self.client2.subscribe('foo', on_subs)
-        self.delayed(0.2, lambda: self.client.publish('foo', 'a'))
-        self.delayed(0.2, lambda: self.client.publish('foo', 'b'))
-        self.delayed(0.3, lambda: self.client.publish('foo', 'c'))
-        self.delayed(0.2, dl)
-        self.delayed(0.5, self.finish)
-        self.start()
-
 
 class AsyncWrapperTestCase(TornadoTestCase):
     def test_wrapper(self):
@@ -910,5 +808,6 @@ class ReconnectTestCase(TornadoTestCase):
                 ])
             )
         ])
+
 if __name__ == '__main__':
     unittest.main()
