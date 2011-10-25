@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 import socket
 import weakref
+from tornado.ioloop import IOLoop
 
 from tornado.iostream import IOStream
 
 import logging
+from brukva.stream import BrukvaStream
+
 log = logging.getLogger('brukva.pool')
 log_blob = logging.getLogger('brukva.pool.blob')
 
@@ -14,10 +17,8 @@ from brukva.exceptions import ConnectionError
 
 class Connection(object):
     def __init__(self, host, port, idx,
-        on_connect, on_disconnect,
-        timeout=None, io_loop=None):
-
-        # FIXME: io_loop can't be None
+                 on_connect, on_disconnect,
+                 timeout=None, io_loop=None):
         self.host = host
         self.port = port
         self.idx = idx
@@ -26,10 +27,11 @@ class Connection(object):
         self.on_disconnect = on_disconnect
 
         self.timeout = timeout
-        self._io_loop = io_loop
+        self._io_loop = io_loop or IOLoop.instance()
 
         self._stream = None
         self.try_left = 2
+        self._consume_buffer = ""
         self.is_initialized = False
         self.in_progress = False
         self.read_queue = []
@@ -40,7 +42,7 @@ class Connection(object):
             sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
             sock.settimeout(self.timeout)
             sock.connect((self.host, self.port))
-            self._stream = IOStream(sock, io_loop=self._io_loop)
+            self._stream = BrukvaStream(sock, io_loop=self._io_loop)
         except socket.error, e:
             log.error(e)
             raise ConnectionError(str(e))
@@ -65,9 +67,9 @@ class Connection(object):
                 return
 
         if not self.is_initialized and not before_init:
-                log_blob.debug('wait for connection initialization')
-                self._io_loop.add_callback(lambda: self.write(data, callback, try_left))
-                return
+            log_blob.debug('wait for connection initialization')
+            self._io_loop.add_callback(lambda: self.write(data, callback, try_left))
+            return
 
         if try_left > 0:
             try:
@@ -90,7 +92,13 @@ class Connection(object):
                 self.disconnect()
                 raise ConnectionError('Tried to read from non-existent connection')
             log_blob.debug('read %s bytes from %s', length, self.idx)
-            self._stream.read_bytes(length, callback)
+            if self._consume_buffer:
+                data = self._consume_buffer[:length]
+                self._consume_buffer = self._consume_buffer[length:]
+                callback(data)
+            else:
+                self._stream.read_bytes(length, callback)
+
         except IOError:
             self.on_disconnect()
 
@@ -101,9 +109,40 @@ class Connection(object):
                 raise ConnectionError('Tried to read from non-existent connection')
 
             log_blob.debug('readline from %s', self.idx)
-            self._stream.read_until('\r\n', callback)
+            if self._consume_buffer:
+                log_blob.debug('consume buffer')
+                splitted_buffer = self._consume_buffer.split('\r\n', 1)
+                line = splitted_buffer[0] + '\r\n'
+                self._consume_buffer = self._consume_buffer[len(line):]
+                callback(line)
+            else:
+                log_blob.debug('no consume buffer')
+                self._stream.read_until('\r\n', callback)
         except IOError:
             self.on_disconnect()
+
+    def readlines(self, num, callback):
+        try:
+            if not self._stream:
+                self.disconnect()
+                raise ConnectionError('Tried to read from non-existent connection')
+            self._stream.read_until_times('\r\n', num, callback)
+        except IOError:
+            self.on_disconnect()
+
+    def read_multibulk_reply(self, num_answers, callback):
+        try:
+            if not self._stream:
+                self.disconnect()
+                raise ConnectionError('Tried to read from non-existent connection')
+
+            if self._consume_buffer:
+                callback(self._consume_buffer)
+            else:
+                self._stream.read_multibulk(num_answers, callback)
+        except IOError:
+            self.on_disconnect()
+
 
 class ConnectionPool(object):
     def __init__(self, connection_args, on_connect, on_disconnect, io_loop, pool_size=4):
@@ -127,7 +166,7 @@ class ConnectionPool(object):
         self.io_loop = io_loop
 
         self.connection_args['io_loop'] = io_loop
-        self.connection_args['on_disconnect'] =  on_disconnect
+        self.connection_args['on_disconnect'] = on_disconnect
 
         self.connection_requests_queue = []
 
@@ -151,7 +190,7 @@ class ConnectionPool(object):
                 if add_to_free:
                     self.free_connections.add(connection.idx)
                     log.info('connection %s added to pool',
-                        connection.idx)
+                             connection.idx)
                 self.io_loop.add_callback(self._give_out_pending_requests)
 
             connection_args['on_connect'] = on_connect
@@ -160,6 +199,11 @@ class ConnectionPool(object):
             connection.connect()
             self.connections[idx] = connection
         self.is_connected = True
+
+    def disconnect(self):
+        for conn in self.connections.values():
+            conn.disconnect()
+
 
     def _give_out_pending_requests(self):
         while self.connection_requests_queue and self.free_connections:

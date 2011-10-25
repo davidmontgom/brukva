@@ -1,90 +1,17 @@
 # -*- coding: utf-8 -*-
-
-from functools import partial
-from itertools import izip
-import logging
-from collections import Iterable, defaultdict
+from collections import  defaultdict
 import weakref
-
-
+from redis.client import  dict_merge
 from tornado.ioloop import IOLoop
+
 from adisp import async, process
 
-from datetime import datetime
-from brukva.utils import execution_context
+from brukva.utils import *
 from brukva.pool import ConnectionPool
-from brukva.exceptions import  ConnectionError, ResponseError, RedisError
-from brukva.stream import BrukvaStream
+from brukva.exceptions import  ConnectionError, ResponseError, RedisError, InternalRedisError
 
 log = logging.getLogger('brukva.client')
 log_blob = logging.getLogger('brukva.client.blob')
-
-class ExecutionContext(object):
-    def __init__(self, callbacks, error_wrapper=None):
-        self.callbacks = callbacks
-        self.error_wrapper = error_wrapper
-        self.is_active = True
-
-    def _call_callbacks(self, callbacks, value):
-        if callbacks:
-            if isinstance(callbacks, Iterable):
-                for cb in callbacks:
-                    cb(value)
-            else:
-                callbacks(value)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, type_, value, tb):
-        if type_ is None:
-            return True
-
-        if self.error_wrapper:
-            value = self.error_wrapper(value)
-        else:
-            value = value or Exception(
-                'Strange exception with None value type: %s; tb: %s' %
-                (type_, '\n'.join(traceback.format_tb(tb))
-                    ))
-
-        if self.is_active:
-            log.error(value, exc_info=(type_, value, tb))
-            self.ret_call(value)
-            return True
-        else:
-            return False
-
-    def disable(self):
-        self.is_active = False
-
-    def enable(self):
-        self.is_active = True
-
-    def ret_call(self, value):
-        self.is_active = False
-        self._call_callbacks(self.callbacks, value)
-        self.is_active = True
-
-    def safe_call(self, callbacks, value):
-        self.is_active = False
-        self._call_callbacks(callbacks, value)
-        self.is_active = True
-
-
-def execution_context(callbacks, error_wrapper=None):
-    """
-    Syntax sugar.
-    If some error occurred inside with block,
-    it will be suppressed and forwarded to callbacks.
-
-    Use contex.ret_call(value) method to call callbacks.
-
-    @type callbacks: callable or iterator over callables
-    @rtype: context
-    """
-    return ExecutionContext(callbacks, error_wrapper)
-
 
 class CmdLine(object):
     def __init__(self, cmd, *args, **kwargs):
@@ -94,242 +21,6 @@ class CmdLine(object):
 
     def __repr__(self):
         return self.cmd + '(' + str(self.args) + ',' + str(self.kwargs) + ')'
-
-
-def string_keys_to_dict(key_string, callback):
-    return dict([(key, callback) for key in key_string.split()])
-
-
-def dict_merge(*dicts):
-    merged = {}
-    [merged.update(d) for d in dicts]
-    return merged
-
-
-def encode(value):
-    if isinstance(value, str):
-        return value
-    elif isinstance(value, unicode):
-        return value.encode('utf-8')
-        # pray and hope
-    return str(value)
-
-
-def format(*tokens):
-    cmds = []
-    for t in tokens:
-        e_t = encode(t)
-        cmds.append('$%s\r\n%s\r\n' % (len(e_t), e_t))
-    return '*%s\r\n%s' % (len(tokens), ''.join(cmds))
-
-
-def format_pipeline_request(command_stack):
-    """
-        @command_stack: [CmdLine(), ...]
-        @return: str
-        Return serialized request to redis for pipeline
-    """
-    return ''.join(format(c.cmd, *c.args, **c.kwargs) for c in command_stack)
-
-class Connection(object):
-    def __init__(self, host, port, on_connect, on_disconnect, timeout=None, io_loop=None):
-        self.host = host
-        self.port = port
-        self.on_connect = on_connect
-        self.on_disconnect = on_disconnect
-        self.timeout = timeout
-        self._stream = None
-        self._io_loop = io_loop
-        self.try_left = 2
-        self._consume_buffer = ""
-
-        self.in_progress = False
-        self.read_queue = []
-
-    def connect(self):
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
-            sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
-            sock.settimeout(self.timeout)
-            sock.connect((self.host, self.port))
-            self._stream = BrukvaStream(sock, io_loop=self._io_loop)
-            self.connected()
-        except socket.error, e:
-            raise ConnectionError(str(e))
-        self.on_connect()
-
-    def disconnect(self):
-        if self._stream:
-            try:
-                self._stream.close()
-            except socket.error, e:
-                pass
-            self._stream = None
-
-    def write(self, data, try_left=None):
-        if try_left is None:
-            try_left = self.try_left
-        if not self._stream:
-            self.connect()
-            if not self._stream:
-                raise ConnectionError('Tried to write to non-existent connection')
-
-        if try_left > 0:
-            try:
-                self._stream.write(data)
-            except IOError:
-                self.disconnect()
-                self.write(data, try_left - 1)
-        else:
-            raise ConnectionError('Tried to write to non-existent connection')
-
-    def read(self, length, callback):
-        try:
-            if not self._stream:
-                self.disconnect()
-                raise ConnectionError('Tried to read from non-existent connection')
-
-            if self._consume_buffer:
-                data = self._consume_buffer[:length]
-                self._consume_buffer = self._consume_buffer[length:]
-                callback(data)
-            else:
-                self._stream.read_bytes(length, callback)
-
-        except IOError:
-            self.on_disconnect()
-
-    def readline(self, callback):
-        try:
-            if not self._stream:
-                self.disconnect()
-                raise ConnectionError('Tried to read from non-existent connection')
-
-            if self._consume_buffer:
-                splitted_buffer = self._consume_buffer.split('\r\n', 1)
-                line = splitted_buffer[0] + '\r\n'
-                self._consume_buffer = self._consume_buffer[len(line):]
-                callback(line)
-            else:
-                self._stream.read_until('\r\n', callback)
-        except IOError:
-            self.on_disconnect()
-
-    def readlines(self, num, callback):
-        try:
-            if not self._stream:
-                self.disconnect()
-                raise ConnectionError('Tried to read from non-existent connection')
-            self._stream.read_until_times('\r\n', num, callback)
-        except IOError:
-            self.on_disconnect()
-
-    def read_multibulk_reply(self, num_answers, callback):
-        try:
-            if not self._stream:
-                self.disconnect()
-                raise ConnectionError('Tried to read from non-existent connection')
-
-            if self._consume_buffer:
-                callback(self._consume_buffer)
-            else:
-                self._stream.read_multibulk(num_answers, callback)
-        except IOError:
-            self.on_disconnect()
-
-    def try_to_perform_read(self):
-        # have callbacks in queue and process no started
-        if not self.in_progress and self.read_queue:
-            self.in_progress = True
-            # execute oldest callback on next ioloop iteration, with result = None
-            self._io_loop.add_callback(partial(self.read_queue.pop(0), None))
-
-    @async
-    def queue_wait(self, callback=None):
-        self.read_queue.append(callback)
-        self.try_to_perform_read()
-
-    def read_done(self):
-        self.in_progress = False
-        self.try_to_perform_read()
-
-    def connected(self):
-        if self._stream:
-            return True
-        return False
-
-
-def reply_to_bool(r, *args, **kwargs):
-    return bool(r)
-
-
-def make_reply_assert_msg(msg):
-    def reply_assert_msg(r, *args, **kwargs):
-        return r == msg
-
-    return reply_assert_msg
-
-
-def reply_set(r, *args, **kwargs):
-    return set(r)
-
-
-def reply_dict_from_pairs(r, *args, **kwargs):
-    return dict(izip(r[::2], r[1::2]))
-
-
-def reply_str(r, *args, **kwargs):
-    return r or ''
-
-
-def reply_int(r, *args, **kwargs):
-    return int(r) if r is not None else None
-
-
-def reply_float(r, *args, **kwargs):
-    return float(r) if r is not None else None
-
-
-def reply_datetime(r, *args, **kwargs):
-    return datetime.fromtimestamp(int(r))
-
-
-def reply_zset(r, *args, **kwargs):
-    if (not r ) or (not 'WITHSCORES' in args):
-        return r
-    return zip(r[::2], map(float, r[1::2]))
-
-
-def reply_hmget(r, key, *fields, **kwargs):
-    return dict(zip(fields, r))
-
-
-def reply_info(response):
-    info = {}
-
-    def get_value(value):
-        if ',' not in value:
-            return value
-        sub_dict = {}
-        for item in value.split(','):
-            k, v = item.split('=')
-            try:
-                sub_dict[k] = int(v)
-            except ValueError:
-                sub_dict[k] = v
-        return sub_dict
-
-    for line in response.splitlines():
-        key, value = line.split(':')
-        try:
-            info[key] = int(value)
-        except ValueError:
-            info[key] = get_value(value)
-    return info
-
-
-def reply_ttl(r, *args, **kwargs):
-    return r != -1 and r or None
 
 
 class _AsyncWrapper(object):
@@ -401,87 +92,6 @@ class Client(object):
         self._waiting_callbacks = defaultdict(list)
         self._pipeline = None
 
-    def __getattribute__(self, name):
-        """
-        Allow to remove AsyncWrapper from chain of calls
-        """
-        attr = super(Client, self).__getattribute__(name)
-        if super(Client, self).__getattribute__('yield_mode'):
-            func_name = getattr(attr, 'func_name', None)
-            if func_name:
-                if 'callbacks' in attr.func_code.co_varnames:
-                    memoized = super(Client, self).__getattribute__('memoized')
-                    if name not in memoized:
-                        memoized[name] = async(attr, cbname='callbacks')
-                    return memoized[name]
-        return attr
-
-    def __repr__(self):
-        return '<Brukva client %s:%s>' % (self.host, self.port)
-
-    def pipeline(self, transactional=False):
-        if not self._pipeline:
-            if  self.connection_pool.is_connected:
-                self._pipeline = Pipeline(
-                    selected_db=self.selected_db,
-                    password=self.password,
-                    io_loop = self._io_loop,
-                    transactional=transactional
-                )
-                self._pipeline.connection_pool = self.connection_pool
-            else:
-                raise RedisError('Client must be connected befor creating pipeline')
-        return self._pipeline
-
-    #### connection
-    def connect(self):
-        self.connection_pool.connect()
-
-    def disconnect(self):
-        raise NotImplementedError()
-        pass
-        #self.connection.disconnect()
-
-    def on_disconnect(self):
-        raise ConnectionError("Socket closed on remote end")
-
-    ####
-
-    #### formatting
-    def encode(self, value):
-        if isinstance(value, str):
-            return value
-        elif isinstance(value, unicode):
-            return value.encode('utf-8')
-            # pray and hope
-        return str(value)
-
-    def format(self, *tokens):
-        cmds = []
-        for t in tokens:
-            e_t = self.encode(t)
-            cmds.append('$%s\r\n%s\r\n' % (len(e_t), e_t))
-        return '*%s\r\n%s' % (len(tokens), ''.join(cmds))
-
-    def format_reply(self, cmd_line, data):
-        if cmd_line.cmd not in self.REPLY_MAP:
-            return data
-        try:
-            res = self.REPLY_MAP[cmd_line.cmd](data, *cmd_line.args, **cmd_line.kwargs)
-        except Exception, e:
-            raise ResponseError(
-                'failed to format reply to %s, raw data: %s; err message: %s' %
-                (cmd_line, data, e), cmd_line
-            )
-        return res
-
-    ####
-
-    #### new AsIO
-    def call_callbacks(self, callbacks, *args, **kwargs):
-        for cb in callbacks:
-            cb(*args, **kwargs)
-
     @process
     def _initialize_connection(self, connection, callback):
         """
@@ -519,6 +129,85 @@ class Client(object):
             log_blob.debug('connection %s initialized', connection.idx)
             ctx.ret_call(True)
 
+    #### new AsIO
+
+    def __getattribute__(self, name):
+        """
+        Allow to remove AsyncWrapper from chain of calls
+        """
+        attr = super(Client, self).__getattribute__(name)
+        if super(Client, self).__getattribute__('yield_mode'):
+            func_name = getattr(attr, 'func_name', None)
+            if func_name:
+                if 'callbacks' in attr.func_code.co_varnames:
+                    memoized = super(Client, self).__getattribute__('memoized')
+                    if name not in memoized:
+                        memoized[name] = async(attr, cbname='callbacks')
+                    return memoized[name]
+        return attr
+
+    def __repr__(self):
+        return '<Brukva client %s:%s>' % (self.host, self.port)
+    def pipeline(self, transactional=False):
+        if not self._pipeline:
+            if  self.connection_pool.is_connected:
+                self._pipeline = Pipeline(
+                    selected_db=self.selected_db,
+                    password=self.password,
+                    io_loop = self._io_loop,
+                    transactional=transactional
+                )
+                self._pipeline.connection_pool = self.connection_pool
+            else:
+                raise RedisError('Client must be connected befor creating pipeline')
+        return self._pipeline
+
+    #### connection
+
+    def connect(self):
+        self.connection_pool.connect()
+
+    def disconnect(self):
+        self.connection_pool.disconnect()
+
+    #### formatting
+    def on_disconnect(self):
+        raise ConnectionError("Socket closed on remote end")
+
+    ####
+
+    def encode(self, value):
+        if isinstance(value, str):
+            return value
+        elif isinstance(value, unicode):
+            return value.encode('utf-8')
+            # pray and hope
+        return str(value)
+
+    def format(self, *tokens):
+        cmds = []
+        for t in tokens:
+            e_t = self.encode(t)
+            cmds.append('$%s\r\n%s\r\n' % (len(e_t), e_t))
+        return '*%s\r\n%s' % (len(tokens), ''.join(cmds))
+    def format_reply(self, cmd_line, data):
+        if cmd_line.cmd not in self.REPLY_MAP:
+            return data
+        try:
+            res = self.REPLY_MAP[cmd_line.cmd](data, *cmd_line.args, **cmd_line.kwargs)
+        except Exception, e:
+            raise ResponseError(
+                'failed to format reply to %s, raw data: %s; err message: %s' %
+                (cmd_line, data, e), cmd_line
+            )
+        return res
+
+    ####
+
+    def call_callbacks(self, callbacks, *args, **kwargs):
+        for cb in callbacks:
+            cb(*args, **kwargs)
+
 
     @process
     def execute_command(self, cmd, callbacks, *args, **kwargs):
@@ -532,6 +221,14 @@ class Client(object):
             log_blob.debug('try to get connection for %s',  cmd_line)
             connection = yield async(self.connection_pool.request_connection)()
             log_blob.debug('got connection %s for %s cmd_line',connection.idx, cmd_line)
+
+            try:
+                write_res = yield async(connection.write)(self.format(cmd, *args, **kwargs))
+            except Exception, e:
+                connection.disconnect()
+                raise e
+            if isinstance(write_res, Exception):
+                raise write_res
             
             try:
                 data = yield async(connection.readline)()
@@ -547,7 +244,7 @@ class Client(object):
 
     @async
     @process
-    def process_data(self, connection, data, cmd_line, callback):
+    def process_data(self, connection, original_data, cmd_line, callback):
         with execution_context(callback) as ctx:
 
             data = original_data[:-2] # strip \r\n
@@ -583,14 +280,14 @@ class Client(object):
     def consume_multibulk(self, connection, length, cmd_line, callback):
         with execution_context(callback) as ctx:
             tokens = []
-            data = yield async(self.connection.read_multibulk_reply)(length)
+            data = yield async(connection.read_multibulk_reply)(length)
             if not data:
                 raise ResponseError(
                     'Not enough data in response to %s, accumulated tokens: %s' %
                     (cmd_line, tokens), cmd_line
                 )
             
-            self.connection._consume_buffer = data
+            connection._consume_buffer = data
             while len(tokens) < length:
                 data = yield async(connection.readline)()
                 if not data:

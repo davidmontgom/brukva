@@ -18,10 +18,10 @@ c.connect()
 
 start = 0
 count = 0
-finish_count = 4000
+finish_count = 4
 def on_set(result):
     global count
-#    log.debug("set result: %s" % result)
+    log.debug("set result: %s" % result)
     count += 1
     if count >=finish_count:
         print time()-start
@@ -58,5 +58,5 @@ if __name__ == '__main__':
 #    p = pstats.Stats('iostats')
 #    p.sort_stats('time').print_stats(20)
 
-#    instance.start()
+    instance.start()
 
