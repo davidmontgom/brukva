@@ -45,7 +45,7 @@ class TornadoTestCase(unittest.TestCase):
         self.loop = IOLoop.instance()
         setattr(self.loop, 'handle_callback_exception', handle_callback_exception)
         CustomAssertionError.io_loop = self.loop
-        self.client = brukva.Client(selected_db=9, io_loop=self.loop)
+        self.client = brukva.Client(db=9, io_loop=self.loop)
         self.client.connect()
         def on_flushdb_done(callbacks):
             self.is_dirty = False
@@ -788,7 +788,7 @@ class ReconnectTestCase(TornadoTestCase):
     def test_redis_timeout(self):
         self._run_plan([
             ('set', ('foo', 'bar'), self.expect(True)),
-            lambda cb: self.delayed(10, lambda:
+            lambda cb: self.delayed(3, lambda:
                 self.client.get('foo', [
                     self.expect('bar'),
                     cb
@@ -802,7 +802,7 @@ class ReconnectTestCase(TornadoTestCase):
 
         self._run_plan([
             ('set', ('foo', 'bar'), self.expect(True)),
-            lambda cb: self.delayed(10, lambda:
+            lambda cb: self.delayed(3, lambda:
                 pipe.execute([
                     self.pexpect([
                         'bar',

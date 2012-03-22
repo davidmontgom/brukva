@@ -1,8 +1,0 @@
-Exception Exception: Exception('Strange exception with None value type: <type \'exceptions.GeneratorExit\'>; tb:   File "/home/inkvi/.virtualenvs/social/src/brukva/brukva/client.py", line 561, in consume_bulk\n    data = yield async(self.connection.read)(length)\n',) in <generator object consume_bulk at 0x137dfa0> ignored
-
-Traceback (most recent call last):
-  File "/usr/lib/python2.6/logging/handlers.py", line 71, in emit
-    if self.shouldRollover(record):
-  File "/usr/lib/python2.6/logging/handlers.py", line 145, in shouldRollover
-    self.stream.seek(0, 2)  #due to non-posix-compliant Windows feature
-ValueError: I/O operation on closed file

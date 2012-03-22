@@ -12,8 +12,8 @@ class ConnectionError(RedisError):
 
 class RequestError(RedisError):
     def __init__(self, message, cmd_line=None):
-        self.cmd_line = cmd_line
         self.msg = message
+        self.cmd_line = cmd_line
         RedisError.__init__(self, "%s %s" % (message, cmd_line))
 
     def __repr__(self):

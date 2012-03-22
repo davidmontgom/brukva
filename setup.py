@@ -5,7 +5,7 @@ try:
 except ImportError:
     from distutils.core import setup
 
-VERSION = '0.0.6'
+VERSION = '0.0.8'
 
 setup(name='brukva',
       version=VERSION,

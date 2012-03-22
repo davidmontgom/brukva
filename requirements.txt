@@ -1,5 +1,5 @@
 redis
-tornado==2.1.1
+tornado==2.2
 unittest2
 nose
 mock

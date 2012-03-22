@@ -25,7 +25,7 @@ class CmdLine(object):
 
 class _AsyncWrapper(object):
     def __init__(self, obj):
-        self.obj = obj
+        self.obj = weakref.proxy(obj)
         self.memoized = {}
 
     def __getattr__(self, item):
@@ -39,7 +39,7 @@ class _AsyncWrapper(object):
 
 class Client(object):
     def __init__(self, host='localhost', port=6379, password=None,
-                 selected_db=None, io_loop=None, yield_mode=False):
+                 db=None, io_loop=None, yield_mode=False):
         self.yield_mode = yield_mode
         self.memoized = {}
         self._io_loop = io_loop or IOLoop.instance()
@@ -55,12 +55,12 @@ class Client(object):
             io_loop = self._io_loop
         )
 
-        self.async = _AsyncWrapper(weakref.proxy(self))
+        self.async = _AsyncWrapper(self)
 
         self.queue = []
         self.current_cmd_line = None
         self.password = password
-        self.selected_db = selected_db
+        self.db = db
         self.REPLY_MAP = dict_merge(
             string_keys_to_dict('AUTH BGREWRITEAOF BGSAVE DEL EXISTS EXPIRE HDEL HEXISTS '
                                 'HMSET MOVE MSET MSETNX SAVE SETNX',
@@ -102,8 +102,8 @@ class Client(object):
             cmds = []
             if self.password:
                 cmds.append(CmdLine('AUTH', self.password))
-            if self.selected_db:
-                cmds.append(CmdLine('SELECT', self.selected_db))
+            if self.db:
+                cmds.append(CmdLine('SELECT', self.db))
 
             if cmds:
                 try:
@@ -148,11 +148,12 @@ class Client(object):
 
     def __repr__(self):
         return '<Brukva client %s:%s>' % (self.host, self.port)
+
     def pipeline(self, transactional=False):
         if not self._pipeline:
             if  self.connection_pool.is_connected:
                 self._pipeline = Pipeline(
-                    selected_db=self.selected_db,
+                    db=self.db,
                     password=self.password,
                     io_loop = self._io_loop,
                     transactional=transactional
@@ -171,9 +172,12 @@ class Client(object):
         self.connection_pool.disconnect()
 
     #### formatting
-    def on_disconnect(self):
-        raise ConnectionError("Socket closed on remote end")
-
+    def on_disconnect(self, callback=None):
+        error = ConnectionError("Socket closed on remote end")
+        if callable(callback):
+            callback(error)
+        else:
+            raise error
     ####
 
     def encode(self, value):
@@ -224,16 +228,14 @@ class Client(object):
 
             try:
                 write_res = yield async(connection.write)(self.format(cmd, *args, **kwargs))
-            except Exception, e:
+            except Exception as e:
                 connection.disconnect()
-                raise e
-            if isinstance(write_res, Exception):
-                raise write_res
-            
+                ctx.ret_call(e)
+
             try:
                 data = yield async(connection.readline)()
                 if not data:
-                    raise Exception('TODO: [no data from connection %s->readline' % connection.idx)
+                    raise Exception('TODO: no data from connection %s->readline' % connection.idx)
                 else:
                     response = yield self.process_data(connection, data, cmd_line)
                     result = self.format_reply(cmd_line, response)
@@ -286,7 +288,7 @@ class Client(object):
                     'Not enough data in response to %s, accumulated tokens: %s' %
                     (cmd_line, tokens), cmd_line
                 )
-            
+
             connection._consume_buffer = data
             while len(tokens) < length:
                 data = yield async(connection.readline)()
@@ -297,7 +299,7 @@ class Client(object):
                     )
                 token = yield self.process_data(connection, data, cmd_line) #FIXME error
                 tokens.append( token )
-                
+
             ctx.ret_call(tokens)
 
     @async
