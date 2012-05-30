@@ -339,6 +339,9 @@ class Client(object):
     def info(self, callbacks=None):
         self.execute_command('INFO', callbacks)
 
+    def select(self, db, callbacks=None):
+        self.selected_db = db
+        self.execute_command('SELECT', callbacks, db)
 
     def shutdown(self, callbacks=None):
         self.execute_command('SHUTDOWN', callbacks)
