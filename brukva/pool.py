@@ -249,6 +249,7 @@ class ConnectionPool(object):
         self.connections = {}
         self.free_connections = set()
         connection_args = self.connection_args
+        log.debug('establishing %d connections inside pool with args %s', self.pool_size, self.connection_args)
         for idx in xrange(self.pool_size):
             @process
             def on_connect(connection, add_to_free=True):
@@ -268,15 +269,19 @@ class ConnectionPool(object):
             connection_args['on_connect'] = on_connect
             connection_args['idx'] = idx
             connection = Connection(**connection_args)
-            connection.connect()
+            yield connection.connect()
             self.connections[idx] = connection
         self.is_connected = True
 
     def disconnect(self):
+        log.debug('disconnecting for all connections inside pool')
         for conn in self.connections.values():
             conn.disconnect()
 
     def _give_out_pending_requests(self):
+        log.debug('give_out_pending_requests. connection_requests_queue: %s. free connections: %s',
+                  self.connection_requests_queue,
+                  self.free_connections)
         while self.connection_requests_queue and self.free_connections:
             log_blob.debug('late leasing connection')
             callback = self.connection_requests_queue.pop(0)
@@ -294,6 +299,7 @@ class ConnectionPool(object):
         self.io_loop.add_callback(lambda: callback(connection))
 
     def request_connection(self, callback):
+        log_blob.debug('requesting connection')
         if not self.free_connections:
             log_blob.debug('no free connections, waiting')
             self.connection_requests_queue.append(callback)
