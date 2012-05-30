@@ -30,54 +30,71 @@ class Connection(object):
         self.on_connect = on_connect
         self.on_disconnect = on_disconnect
 
-        self.reconnect_timeout = reconnect_timeout
-        self.reconnect_retries = reconnect_retries
+        self.reconnect_timeout = reconnect_timeout or 0.3
+        self.reconnect_retries = reconnect_retries or 1
 
         self.timeout = timeout
         self._io_loop = io_loop or IOLoop.instance()
 
         self._stream = None
-        self.try_left = 2
+        self.retries = retries or 2
         self._consume_buffer = ""
         self.is_initialized = False
         self.in_progress = False
         self.read_queue = []
+        self.read_callbacks = []
 
+    @async
     @process
-    def connect(self, add_to_free=True):
+    def connect(self, add_to_free=True, callback=None):
         retries = self.reconnect_retries
 
         while True:
             try:
+                log.info('trying to connect in connection %s. Retry #%d', self.idx,
+                         self.reconnect_retries-retries+1)
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
                 sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
                 sock.settimeout(self.timeout)
                 sock.connect((self.host, self.port))
                 self._stream = BrukvaStream(sock, io_loop=self._io_loop)
+                self._stream.set_close_callback(self.on_stream_close)
                 break
             except socket.error, e:
-                log.error('Exception during connection!')
-                log.error(e)
-
-                log.info('Connect. Retry #%d' % retries)
+                log.error('Exception during connection %s!: %s', self.idx, str(e))
 
                 retries -= 1
 
-                if retries <= 0:
-                    raise ConnectionError("Exceeded retries to connect")
+                log.debug('Retries: %d', retries)
 
+                if retries <= 0:
+                    log.info('No more retries to connect for connection %s', self.idx)
+                    callback(ConnectionError("Exceeded retries to connect in connection %s" % self.idx))
+                    return
+
+                log.debug('sleeping %s sec during reconnect_timeout in connection %s',
+                          self.reconnect_timeout, self.idx)
                 if self._io_loop.running():
                     instance = self._io_loop.instance()
-                    yield async(instance.add_timeout, time() + 1)()
+                    yield async(partial(instance.add_timeout, time() + self.reconnect_timeout))()
                 else:
                     sleep(self.reconnect_timeout)
 
-        self._io_loop.add_callback(
-            lambda: self.on_connect(weakref.proxy(self),
-                                    add_to_free=add_to_free)
-        )
+                log.debug('sleeping finished in connection %s', self.idx)
+
+        self.on_connect(weakref.proxy(self), add_to_free=add_to_free)
+        callback(True)
+
+    def on_stream_close(self):
+        log.debug('on_stream_close called - close callback for IOStream')
+        if self._stream:
+            self._stream = None
+            for callback in self.read_callbacks:
+                callback(None)
+            self.read_callbacks = []
 
     def disconnect(self):
+        log.debug('disconnecting for connection %s', self.idx)
         if self._stream:
             try:
                 self._stream.close()
@@ -135,22 +152,29 @@ class Connection(object):
         except IOError:
             self.on_disconnect(callback)
 
+    def readline_callback(self, callback, *args, **kwargs):
+        self.read_callbacks.remove(callback)
+        callback(*args, **kwargs)
+
     def readline(self, callback):
         try:
             if not self._stream:
                 self.disconnect()
                 callback(ConnectionError('Tried to read from non-existent connection'))
 
-            log_blob.debug('readline from %s', self.idx)
+            saved_callback = stack_context.wrap(callback)
+            self.read_callbacks.append(saved_callback)
+
+            log_blob.debug('readline from connection %s', self.idx)
             if self._consume_buffer:
-                log_blob.debug('consume buffer')
-                splitted_buffer = self._consume_buffer.split('\r\n', 1)
-                line = splitted_buffer[0] + '\r\n'
+                log_blob.debug('using consumer buffer for connection %s', self.idx)
+                splited_buffer = self._consume_buffer.split('\r\n', 1)
+                line = splited_buffer[0] + '\r\n'
                 self._consume_buffer = self._consume_buffer[len(line):]
                 callback(line)
             else:
-                log_blob.debug('no consume buffer')
-                self._stream.read_until('\r\n', callback)
+                log_blob.debug('no consume buffer for connection %s', self.idx)
+                self._stream.read_until('\r\n', callback=partial(self.readline_callback, saved_callback))
         except IOError:
             self.on_disconnect(callback)
 
