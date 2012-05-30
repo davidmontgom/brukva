@@ -211,43 +211,44 @@ class Client(object):
             )
         return res
 
-    ####
-
     def call_callbacks(self, callbacks, *args, **kwargs):
         for cb in callbacks:
             cb(*args, **kwargs)
-
 
     @process
     def execute_command(self, cmd, callbacks, *args, **kwargs):
         cmd_line = CmdLine(cmd, *args, **kwargs)
         with execution_context(callbacks) as ctx:
-            if callbacks is None:
-                callbacks = []
-            elif not hasattr(callbacks, '__iter__'):
-                callbacks = [callbacks]
-
-            log_blob.debug('try to get connection for %s',  cmd_line)
-            connection = yield async(self.connection_pool.request_connection)()
-            log_blob.debug('got connection %s for %s cmd_line',connection.idx, cmd_line)
-
+            connection = None
             try:
-                write_res = yield async(connection.write)(self.format(cmd, *args, **kwargs))
-            except Exception as e:
-                connection.disconnect()
-                ctx.ret_call(e)
+                log_blob.debug('try to get connection for %s',  cmd_line)
+                connection = yield async(self.connection_pool.request_connection)()
+                log_blob.debug('got connection %s for %s cmd_line',connection.idx, cmd_line)
+                if connection is None:
+                    raise Exception('Connection is None, when is should be Connection instance')
 
-            try:
+                yield async(connection.write)(self.format(cmd, *args, **kwargs))
+
                 data = yield async(connection.readline)()
                 if not data:
                     raise Exception('TODO: no data from connection %s->readline' % connection.idx)
-                else:
-                    response = yield self.process_data(connection, data, cmd_line)
-                    result = self.format_reply(cmd_line, response)
-                    log_blob.debug('got result %s on cmd %s with connection %s', result, cmd_line, connection.idx)
+
+                log.debug('Answer from redis server for connection %s: %s', connection.idx, data)
+
+                response = yield self.process_data(connection, data, cmd_line)
+                result = self.format_reply(cmd_line, response)
+                log_blob.debug('Formatted result %s on cmd %s with connection %s', result, cmd_line, connection.idx)
+
+                ctx.ret_call(result)
+
+            except Exception:
+                if connection is not None:
+                    log.info('doing disconnect due exception while executing command %s', cmd_line)
+                    connection.disconnect()
+                    raise
             finally:
-                self.connection_pool.return_connection(connection)
-            ctx.ret_call(result)
+                if connection is not None:
+                    self.connection_pool.return_connection(connection)
 
     @async
     @process

@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-import logging
 import sys
 from tornado import stack_context
 from tornado.iostream import IOStream, _merge_prefix
@@ -58,7 +57,7 @@ class BrukvaStream(IOStream):
 
             if not buffer:
                 return False
-            
+
             while True:
                 splitted_buffer = buffer.split(delimiter, 1)
                 if len(splitted_buffer) == 2:
