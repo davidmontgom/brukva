@@ -39,7 +39,8 @@ class _AsyncWrapper(object):
 
 class Client(object):
     def __init__(self, host='localhost', port=6379, password=None,
-                 db=None, io_loop=None, yield_mode=False):
+                 db=None, io_loop=None, yield_mode=False, pool_size=None,
+                 retries = None, reconnect_timeout=None, reconnect_retries=None):
         self.yield_mode = yield_mode
         self.memoized = {}
         self._io_loop = io_loop or IOLoop.instance()
@@ -49,10 +50,14 @@ class Client(object):
         self.connection_pool = ConnectionPool({
             'host': host,
             'port': port,
+            'reconnect_retries': reconnect_retries,
+            'reconnect_timeout': reconnect_timeout,
+            'retries': retries
         },
             on_connect = self._initialize_connection,
             on_disconnect = self.on_disconnect,
-            io_loop = self._io_loop
+            io_loop=self._io_loop,
+            pool_size = pool_size,
         )
 
         self.async = _AsyncWrapper(self)

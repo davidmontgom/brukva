@@ -1,28 +1,28 @@
 # -*- coding: utf-8 -*-
 from functools import partial
 import socket
-from time import sleep, time
 import weakref
+import logging
+from time import sleep, time
+from tornado import stack_context
+
 from tornado.ioloop import IOLoop
 
-from tornado.iostream import IOStream
-
-import logging
 from brukva.stream import BrukvaStream
+from brukva.adisp import async, process
+from brukva.exceptions import ConnectionError
 
 log = logging.getLogger('brukva.pool')
 log_blob = logging.getLogger('brukva.pool.blob')
-
-from adisp import async, process
-from brukva.exceptions import ConnectionError
 
 
 class Connection(object):
     def __init__(self, host, port, idx,
                  on_connect, on_disconnect,
                  timeout=None, io_loop=None,
-                 reconnect_timeout=0.1,
-                 reconnect_retries=1):
+                 retries = None,
+                 reconnect_timeout=None,
+                 reconnect_retries=None):
         self.host = host
         self.port = port
         self.idx = idx
@@ -180,8 +180,7 @@ class Connection(object):
 
 
 class ConnectionPool(object):
-    def __init__(self, connection_args, on_connect, on_disconnect, io_loop,
-                 pool_size=4):
+    def __init__(self, connection_args, on_connect, on_disconnect, io_loop, pool_size=None):
         """
             connection_args:
             {
@@ -193,7 +192,7 @@ class ConnectionPool(object):
                 auth = None,
             }
         """
-        self.pool_size = pool_size
+        self.pool_size = pool_size or 4
         self.connection_args = connection_args
 
         self._on_connect = on_connect
