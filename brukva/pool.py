@@ -103,37 +103,46 @@ class Connection(object):
             self.is_initialized = False
             self._stream = None
 
-    def write(self, data, callback, try_left=None, before_init=False):
-        if try_left is None:
-            try_left = self.try_left
+    @process
+    def write(self, data, callback, retries=None, before_init=False):
+        if retries is None:
+            retries = self.retries
 
         if not self._stream:
             try:
-                self.connect(add_to_free=False)
+                log_blob.debug('No stream when going to write for connection %s', self.idx)
+                yield self.connect(add_to_free=False)
+                log_blob.debug('Connected inside write?')
             except ConnectionError as e:
                 callback(e)
+                return
 
         if not self.is_initialized and not before_init:
             log_blob.debug('wait for connection initialization')
             self._io_loop.add_callback(
-                lambda: self.write(data, callback, try_left))
+                lambda: self.write(data, callback, retries))
             return
 
-        if try_left > 0:
-            try:
-                log_blob.debug('try write %r to %s', data, self.idx)
-                self._stream.write(data)
-
-                log_blob.debug('data written to socket')
-                callback(True)
-                #self._io_loop.add_callback(lambda: callback(True))
-            except IOError, e:
-                log.error(e)
-                self.disconnect()
-                self.write(data, callback=callback, try_left=try_left - 1)
-        else:
+        if retries <= 0:
             callback(
                 ConnectionError('Tried to write to non-existent connection'))
+            return
+
+        try:
+            log_blob.debug('try write data %r to connection %s. retry #%d', data, self.idx,
+                           self.retries - retries + 1)
+            self._stream.write(data)
+            log_blob.debug('data written to socket in connection %s', self.idx)
+            callback(True)
+            #self._io_loop.add_callback(lambda: callback(True))
+        except IOError as e:
+            log_blob.info('exception while writing to socket in connection %s', self.idx)
+            log.error(e)
+            self.disconnect()
+            self.write(data, callback=callback, retries=retries - 1)
+        except Exception as e:
+            # we connected, then
+            callback(e)
 
     def read(self, length, callback):
         try:
@@ -231,7 +240,7 @@ class ConnectionPool(object):
 
         self.is_connected = False
 
-
+    @process
     def connect(self):
         """
             Create connection pool, connect all connection
